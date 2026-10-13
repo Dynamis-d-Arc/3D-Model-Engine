@@ -26,7 +26,13 @@ AI key are not available. Fast subset without external applications:
 | `test_blender_integration.py` | **real** Blender | saved project + exports exist, re-import within 1 mm, `.blend` reopens with every object, room edit reuses 59/60 exports byte-for-byte |
 | `test_ui_e2e.py` | **real** browser (headless Edge) + real Blender | create project, sample layout, draw + undo a room, edit, save version, generate, 3D preview, pick |
 | `test_unreal_integration.py` | **real** Unreal (+ real Blender) | import within 1 cm, re-import reuses meshes, tour: nav path + every room reachable, click-to-walk arrival, wall collision, selection, screenshots; the same through the API job route |
+| `test_viewer.py` | automated (synthetic GLB) + 1 **real Blender** test | viewer tokens (scope, expiry, tamper), secret per data dir, log redaction, glTF→Unreal conversion and pre-flight (catches a 2.5 cm misplacement), MATLAB state selection, `/api/viewer/v1` auth/scope/errors, HVAC live labelled simulated vs measured, airflow labelled illustration, launch links; the real Blender glTF export matches the scene model in Unreal space |
+| `test_unreal_viewer.py` | **real packaged viewer** (`dist/TwinViewer`, + real Blender, real backend process) | runtime load + in-engine bounds check, nav path, click-to-walk, wall collision, selection, HVAC selection + telemetry identity with real pushed BMS readings, airflow layer, switching buildings, cache reuse, bad token / expired link / no server exit with code 3, no secrets in the package |
 | `test_ai_live.py` | **real** AI (opt-in `TWIN_RUN_LIVE_AI=1`) | the configured model reads the sample plan; prints dimension accuracy |
 
 The repeatable fixture is `twin/fixtures/sample_apartment.json` (+ `sample_apartment_plan.png`, drawn
 from it by `python -m twin.fixtures.render_plan`). Test artefacts go to `tests/_out/` (git-ignored).
+
+The packaged-viewer tests need `python -m twin.unreal.package` first (skipped otherwise). They open a game
+window for a few minutes; `tests/viewer_harness.py` starts the backend as a subprocess on a free port and a
+private data directory. `TWIN_VIEWER_EXE` points them at another package (e.g. a Shipping build).

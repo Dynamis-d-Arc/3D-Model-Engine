@@ -175,6 +175,8 @@ def register(app: FastAPI, settings: Settings, storage: Storage, jobs: JobManage
             domains[key] = d
         return domains[key]
 
+    app.state.hvac_domain_for = domain_for  # shared with the viewer API (simulated BMS of a version)
+
     @app.get("/api/projects/{pid}/versions/{number}/airflow-domain")
     def airflow_domain(pid: str, number: int, room: str | None = None) -> Response:
         """The voxel domain of the whole level, or of one room in detail (`room`)."""

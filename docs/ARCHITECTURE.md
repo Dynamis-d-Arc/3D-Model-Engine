@@ -12,7 +12,8 @@
 | Geometry | `twin/scene/{geometry,validate,compile,derive,diff,transforms,styles,textures}.py` | validation, deterministic mesh plan, editing helpers, conversions |
 | Assets | `twin/assets/catalog.json` | furniture contract shared by AI, compiler and Blender |
 | Blender worker | `twin/blender/` + `twin/pipeline.py` | library build, scene build, export, re-import verification, manifest |
-| Unreal | `twin/unreal/` + `unreal/TwinWalkthrough/` | import commandlet, C++ walkthrough template, tour, launch |
+| Unreal | `twin/unreal/` + `unreal/TwinWalkthrough/` | C++ walkthrough + **packaged desktop viewer** (runtime glTF loading, no editor), optional editor import commandlet, tour, packaging (`twin/unreal/package.py`) |
+| Viewer API | `twin/viewer/` | read-only `/api/viewer/v1` for the packaged viewer: signed short-lived viewer tokens, viewer manifest + glTF pre-flight, HVAC live data / airflow illustration in Unreal space — see [UNREAL_VIEWER.md](UNREAL_VIEWER.md) |
 
 ## Data flow
 
@@ -27,7 +28,10 @@
    builds, saves, exports; a second Blender process re-imports every export; the backend compares
    Blender's report and the re-import report with the plan (1 mm tolerance). Only then is the build
    `completed` and `manifest.json` written.
-5. **Unreal** (job): the headless editor imports per-object FBX (skipping meshes whose content hash is
+5. **Desktop viewer** (no job, no editor): the web app mints a read-only viewer token; the packaged viewer
+   downloads the build's verified glTF + viewer manifest over `/api/viewer/v1`, builds the walkthrough at
+   runtime and re-checks every actor against the scene model ([UNREAL_VIEWER.md](UNREAL_VIEWER.md)).
+6. **Unreal editor import** (optional developer job): the headless editor imports per-object FBX (skipping meshes whose content hash is
    already imported), builds `L_Walkthrough`, verifies every actor's bounds against the scene model,
    then the scripted tour checks navigation, collision and selection and captures screenshots.
 

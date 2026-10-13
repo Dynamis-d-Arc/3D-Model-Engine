@@ -216,11 +216,43 @@ async function fixPicked(version, info) {
   } catch (e) { showError(e, "Fix with AI"); }
 }
 
+/** Desktop viewer: a short-lived read-only link the packaged Unreal app opens (no editor needed anywhere). */
+function viewerSection(b) {
+  const info = h("div");
+  const launch = async (copy) => {
+    try {
+      const r = await post(`/api/projects/${state.project.id}/viewer/launch`, { build_id: b.id });
+      const text = JSON.stringify(r.launch, null, 1);
+      if (copy) {
+        await navigator.clipboard.writeText(text);
+        toast("Launch code copied. In the desktop viewer press Ctrl+V.", "ok", 7000);
+      } else {
+        const a = h("a", { href: URL.createObjectURL(new Blob([text], { type: "application/json" })), download: r.file_name });
+        document.body.append(a);
+        a.click();
+        a.remove();
+      }
+      mount(info, h("div.notice.ok", null,
+        `Read-only link for this project, valid until ${new Date(r.expires_at * 1000).toLocaleString()}. `,
+        copy ? "Paste it into the viewer with Ctrl+V." : h("span", null, "Open it with ", h("code", null, `"Open Twin Viewer.cmd" "${r.file_name}"`), ".")));
+    } catch (e) { showError(e, "Desktop viewer"); }
+  };
+  return h("div", null,
+    h("h3", null, "Desktop viewer"),
+    h("p.small.muted", null, "Walk through this build in the packaged Unreal viewer: first-person navigation, room list, ",
+      "furniture and HVAC details with live data, airflow illustration. The viewing PC needs no Unreal Editor or Blender; ",
+      "the link holds a short-lived read-only token, never an API key."),
+    h("div.row", null,
+      h("button.btn.primary", { onclick: () => launch(false) }, "Open in desktop viewer"),
+      h("button.btn", { onclick: () => launch(true) }, "Copy launch code")),
+    info);
+}
+
 function unrealCard(b) {
   const ue = state.health.unreal;
-  const card = h("div.card", null, h("h2", null, "Unreal Engine 5"));
+  const card = h("div.card", null, h("h2", null, "Unreal Engine 5"), viewerSection(b), h("h3", null, "Editor import (developer tools)"));
   if (!ue.engine_found || !ue.project_found) {
-    card.append(h("p.muted", null, ue.engine_found ? `Walkthrough project not found at ${ue.project}.` : "Unreal Engine was not found (set TWIN_UNREAL_ENGINE_DIR)."),
+    card.append(h("p.muted", null, ue.engine_found ? `Walkthrough project not found at ${ue.project}.` : "Unreal Engine was not found on the server (not needed for the desktop viewer)."),
       h("p.small", null, "The Unreal bundle above contains everything needed; see docs/UNREAL.md for the manual import steps."));
     return card;
   }
@@ -256,7 +288,7 @@ function unrealCard(b) {
     } catch (e) { showError(e, "Launch walkthrough"); }
   } }, "Launch walkthrough");
   card.append(h("p.small.muted", null, `${ue.engine_dir} · ${ue.project}`),
-    ue.module_built ? null : h("div.notice.warn", null, "The walkthrough template is not compiled yet: run ", h("code", null, "python -m twin.unreal.setup"), " (see docs/UNREAL.md)."),
+    ue.module_built ? "" : h("div.notice.warn", null, "The walkthrough template is not compiled yet: run ", h("code", null, "python -m twin.unreal.setup"), " (see docs/UNREAL.md)."),
     h("div.row", null, importBtn, launchBtn), status);
   return card;
 }

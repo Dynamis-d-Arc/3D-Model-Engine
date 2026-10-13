@@ -58,7 +58,16 @@ set `TWIN_BLENDER_PATH` otherwise. Without an AI key everything except "Interpre
 3. Put a model that passes into `TWIN_AI_MODEL`, restart the server, run the probe again.
 4. Optional real test (costs tokens): `TWIN_RUN_LIVE_AI=1 .venv/Scripts/python.exe -m pytest -m live_ai -s`
 
-### Unreal walkthrough
+### Unreal desktop viewer (no editor needed to view)
+
+```bash
+.venv/Scripts/python.exe -m twin.unreal.package
+```
+packages `unreal/TwinWalkthrough` into `dist/TwinViewer/Windows` (developer machine with UE 5.8). Give that
+folder to anyone; in the web app **Open in desktop viewer** hands them a short-lived read-only link and the
+viewer downloads the building from the backend at runtime. See [docs/UNREAL_VIEWER.md](docs/UNREAL_VIEWER.md).
+
+### Unreal walkthrough (editor import, developer tool)
 
 ```bash
 .venv/Scripts/python.exe -m twin.unreal.setup

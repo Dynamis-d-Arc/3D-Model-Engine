@@ -119,6 +119,11 @@ class Settings:
     ai: AISettings
     render_previews: bool = True
     extra: dict = field(default_factory=dict)
+    # desktop / streamed Unreal viewer (twin/viewer): token signing secret (None = generated per data dir),
+    # token lifetime, and the backend URL written into launch files (None = the URL the request came in on)
+    viewer_secret: SecretStr | None = None
+    viewer_token_ttl_h: float = 12.0
+    public_url: str | None = None
 
 
 def load_settings(env: dict[str, str] | None = None, env_file: Path | None = ENV_FILE) -> Settings:
@@ -157,6 +162,9 @@ def load_settings(env: dict[str, str] | None = None, env_file: Path | None = ENV
                                     default=str(PROJECT_ROOT / "unreal" / "TwinWalkthrough" / "TwinWalkthrough.uproject"))),
         ai=ai,
         render_previews=_lookup(env, fv, "TWIN_RENDER_PREVIEWS", default="1") not in ("0", "false", "no"),
+        viewer_secret=SecretStr(v) if (v := _lookup(env, fv, "TWIN_VIEWER_SECRET")) else None,
+        viewer_token_ttl_h=float(_lookup(env, fv, "TWIN_VIEWER_TOKEN_TTL_H", default="12")),
+        public_url=(_lookup(env, fv, "TWIN_PUBLIC_URL") or "").rstrip("/") or None,
     )
 
 
@@ -168,7 +176,7 @@ def get_settings() -> Settings:
 class RedactSecrets(logging.Filter):
     """Belt and braces: scrub the configured key and anything key-shaped from log records."""
 
-    PATTERN = re.compile(r"(sk-[A-Za-z0-9_\-]{8,}|Bearer\s+[A-Za-z0-9_\-\.]{8,})")
+    PATTERN = re.compile(r"(sk-[A-Za-z0-9_\-]{8,}|Bearer\s+[A-Za-z0-9_\-\.]{8,}|tvw1\.[A-Za-z0-9_\-\.]{8,})")
 
     def __init__(self, secrets: list[str] | None = None) -> None:
         super().__init__()
@@ -188,8 +196,8 @@ class RedactSecrets(logging.Filter):
 
 
 def install_log_redaction(settings: Settings) -> None:
-    secret = settings.ai.api_key.get_secret_value() if settings.ai.api_key else None
-    f = RedactSecrets([secret] if secret else [])
+    secrets_ = [s.get_secret_value() for s in (settings.ai.api_key, settings.viewer_secret) if s is not None]
+    f = RedactSecrets(secrets_)
     root = logging.getLogger()
     for h in root.handlers or []:
         h.addFilter(f)

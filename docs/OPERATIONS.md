@@ -16,6 +16,12 @@
   limit, stored under generated ids (never user file names).
 * Downloads: build files resolved and checked to stay inside the build directory; ids are validated.
 * AI requests use `store: false`; a daily request limit caps cost.
+* Desktop viewer: the packaged app holds no secret. It gets a signed, read-only, project-scoped token that
+  expires (`TWIN_VIEWER_TOKEN_TTL_H`, default 12 h); the signing secret (`TWIN_VIEWER_SECRET` or
+  `data/viewer_secret.key`) never leaves the server and is redacted from logs, as are `tvw1.` tokens.
+  `python -m twin.unreal.package` refuses to produce a package that contains a backend secret.
+  `POST /api/projects/{p}/viewer/launch` is as open as the rest of the web API until accounts exist —
+  keep the loopback binding or put the backend behind authentication before exposing it.
 * Builds/jobs never delete user data; versions and builds are append-only.
 
 ## Roadmap to a service (stages 4–5, not implemented)
@@ -29,4 +35,4 @@
 | Storage | object storage for uploads/builds, Postgres instead of SQLite, signed download URLs |
 | Jobs | external queue (e.g. Redis/RQ or Celery) and separate Blender/Unreal worker machines (GPU) |
 | Limits & cost | per-user quotas, token budgets, cost dashboard from `ai_calls` |
-| Unreal | packaged walkthrough builds (BuildCookRun), Pixel Streaming for browser delivery |
+| Unreal | packaged viewer done ([UNREAL_VIEWER.md](UNREAL_VIEWER.md)); next: Pixel Streaming (plan in that file), signed viewer releases, multi-level buildings |

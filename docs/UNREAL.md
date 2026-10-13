@@ -1,5 +1,9 @@
 # Unreal Engine 5 walkthrough
 
+> **For people viewing buildings use the packaged desktop viewer** ([UNREAL_VIEWER.md](UNREAL_VIEWER.md)): it
+> loads builds from the backend at runtime and needs no Unreal Editor anywhere except on the machine that
+> packages it. The editor import below is a developer / QA tool (and the way to make a cooked, hand-tuned level).
+
 ## What exists
 
 * **Engine**: UE 5.8.3 at `C:\Program Files\Epic Games\UE_5.8` (auto-detected; `TWIN_UNREAL_ENGINE_DIR`).

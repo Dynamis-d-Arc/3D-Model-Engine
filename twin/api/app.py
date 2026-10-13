@@ -677,6 +677,10 @@ def create_app(settings: Settings | None = None, ai_transport=None) -> FastAPI:
     from twin.hvac.routes import register as register_hvac
     register_hvac(app, settings, storage, jobs, store_version, ApiError)
 
+    # ---- read-only API of the packaged Unreal viewer (token-protected) -------------------------
+    from twin.viewer.routes import register as register_viewer
+    register_viewer(app, settings, storage)
+
     # ---- unreal (registered by twin.unreal.routes when available) ----------------------------
     try:
         from twin.unreal.routes import register as register_unreal
