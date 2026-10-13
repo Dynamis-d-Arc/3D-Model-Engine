@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Floor Plan Twin</title>
+  <link rel="stylesheet" href="styles.css">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect x='1' y='1' width='14' height='14' fill='none' stroke='%232f5d8a' stroke-width='2'/%3E%3Cpath d='M1 8h7v7' fill='none' stroke='%232f5d8a' stroke-width='2'/%3E%3C/svg%3E">
+  <script type="importmap">
+    { "imports": { "three": "/vendor/three/build/three.module.js",
+                   "three/addons/": "/vendor/three/examples/jsm/" } }
+  </script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">Floor&nbsp;Plan&nbsp;Twin</div>
+    <div class="project-picker">
+      <select id="projectSelect" aria-label="Project"></select>
+      <button id="newProjectBtn" class="btn">New project</button>
+    </div>
+    <div id="systemStatus" class="system-status" aria-live="polite"></div>
+  </header>
+
+  <nav class="tabs" role="tablist">
+    <button role="tab" data-tab="brief" class="tab active">1 · Brief &amp; files</button>
+    <button role="tab" data-tab="review" class="tab">2 · Review layout</button>
+    <button role="tab" data-tab="generate" class="tab">3 · Generate &amp; preview</button>
+    <button role="tab" data-tab="live" class="tab">4 · Live HVAC</button>
+    <button role="tab" data-tab="activity" class="tab">Activity</button>
+  </nav>
+
+  <main>
+    <section id="tab-brief" class="tab-panel active"></section>
+    <section id="tab-review" class="tab-panel"></section>
+    <section id="tab-generate" class="tab-panel"></section>
+    <section id="tab-live" class="tab-panel"></section>
+    <section id="tab-activity" class="tab-panel"></section>
+    <div id="emptyState" class="empty-state hidden">
+      <h2>Create a project to start</h2>
+      <p>Upload a floor plan, enter the dimensions you know, review the interpreted layout, then generate a
+         Blender project and an Unreal-ready export.</p>
+      <button id="emptyNewBtn" class="btn primary">New project</button>
+    </div>
+  </main>
+
+  <div id="toasts" class="toasts" aria-live="assertive"></div>
+  <dialog id="dialog"></dialog>
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>

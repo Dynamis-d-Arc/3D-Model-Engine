@@ -1,0 +1,41 @@
+[project]
+name = "floorplan-twin"
+version = "0.1.0"
+description = "AI-assisted floor plan to 3D digital twin pipeline (scene model -> Blender -> Unreal Engine 5)"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "pydantic>=2.8",
+    "python-multipart>=0.0.9",
+    "httpx>=0.27",
+    "shapely>=2.1",
+    "pillow>=10.4",
+    "pymupdf>=1.24",
+    "numpy>=1.26",
+    "rapidocr_onnxruntime>=1.4",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["twin*"]
+
+[tool.setuptools.package-data]
+twin = ["assets/*.json", "blender/scripts/*.py", "unreal/scripts/*.py"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "blender: real integration test that launches Blender headless (skipped when Blender is not configured)",
+    "unreal: real integration test that launches Unreal Engine headless (skipped when UE is not configured)",
+    "ui: real browser end-to-end test (headless Microsoft Edge via Playwright)",
+    "live_ai: real call to the configured AI provider; costs tokens (opt-in with TWIN_RUN_LIVE_AI=1)",
+    "realdata: regression test on the user's real drawings (skipped when the files are not present; ~2 min with OCR)",
+]
+addopts = "-ra"

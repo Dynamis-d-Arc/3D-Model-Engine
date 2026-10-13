@@ -1,0 +1,41 @@
+# secrets
+.env
+.env.*
+!.env.example
+
+# python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+
+# runtime data: uploads, scene versions, builds (per-project storage)
+data/
+
+# generated binaries (rebuilt from scripts)
+assets_build/
+*.blend1
+
+# frontend deps
+frontend/node_modules/
+
+# unreal generated folders
+unreal/TwinWalkthrough/Binaries/
+unreal/TwinWalkthrough/Intermediate/
+unreal/TwinWalkthrough/Saved/
+unreal/TwinWalkthrough/DerivedDataCache/
+unreal/TwinWalkthrough/Content/Twins/
+unreal/TwinWalkthrough/.vs/
+unreal/TwinWalkthrough/*.sln
+
+# test output
+tests/_out/
+
+# private reference-project material (kept locally, never pushed)
+docs/local/
+tests/local/
+tools/local/
+
+# unreal per-user content
+unreal/TwinWalkthrough/Content/Developers/

@@ -1,0 +1,8 @@
+{
+  "name": "floorplan-twin-frontend",
+  "private": true,
+  "description": "No-build frontend; three.js is served from node_modules by the backend at /vendor/three",
+  "dependencies": {
+    "three": "0.169.0"
+  }
+}
