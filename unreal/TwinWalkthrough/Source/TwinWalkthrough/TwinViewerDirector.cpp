@@ -119,6 +119,7 @@ namespace
 	{
 		return Hex.Len() >= 7 ? FColor::FromHex(Hex) : FColor::White;
 	}
+
 }
 
 ATwinViewerDirector::ATwinViewerDirector()
@@ -242,6 +243,7 @@ void ATwinViewerDirector::BeginPlay()
 	DefaultMaterial = UMaterialInstanceDynamic::Create(SurfaceBase, this);
 	DefaultMaterial->SetVectorParameterValue(TEXT("BaseColor"), FLinearColor(0.6f, 0.6f, 0.6f));
 	bNoCache = FParse::Param(FCommandLine::Get(), TEXT("TwinNoCache"));
+	FParse::Value(FCommandLine::Get(), TEXT("TwinRoomLightScale="), RoomLightScale);
 	int32 MaxMb = 0;
 	if (FParse::Value(FCommandLine::Get(), TEXT("TwinMaxModelMB="), MaxMb) && MaxMb > 0)
 	{
@@ -322,10 +324,16 @@ void ATwinViewerDirector::Retry()
 void ATwinViewerDirector::Unload()
 {
 	++RequestSerial;
-	if (AirflowActor)
+	for (ATwinAirflowActor* A : AirflowActors)
 	{
-		AirflowActor->Clear();
+		if (IsValid(A))
+		{
+			A->Destroy();
+		}
 	}
+	AirflowActors.Reset();
+	AirflowActor = nullptr;
+	Floors.Reset();
 	for (AActor* A : NodeActors)
 	{
 		if (IsValid(A))
@@ -511,6 +519,7 @@ void ATwinViewerDirector::FetchManifest()
 			RoomsById.Add(Str(V->AsObject(), TEXT("id")), V->AsObject());
 		}
 		Launch.ProjectName = Str(J->GetObjectField(TEXT("project")), TEXT("name"));
+		ReadFloors();
 		BytesTotal = (int64)NumOr(J->GetObjectField(TEXT("model")), TEXT("bytes"), 0);
 		if (BytesTotal > MaxModelBytes)
 		{
@@ -849,6 +858,7 @@ void ATwinViewerDirector::SpawnNode(const TwinGltf::FNode& Node)
 	Tag(TEXT("Room"), Str(Meta, TEXT("room_id")));
 	Tag(TEXT("RoomName"), Str(Meta, TEXT("room_name")));
 	Tag(TEXT("Label"), Str(Meta, TEXT("label")));
+	Tag(TEXT("Floor"), Str(Meta, TEXT("floor")));   // multi-floor buildings: F1, F2, ...
 	if (Kind == TEXT("floor"))
 	{
 		const TSharedPtr<FJsonObject> Room = RoomsById.FindRef(Str(Meta, TEXT("room_id")));
@@ -919,25 +929,35 @@ void ATwinViewerDirector::SpawnEnvironment()
 			continue;
 		}
 		FVector Loc;
-		if (!Vec(L, TEXT("location_cm"), Loc))
+		if (!Vec(L, TEXT("location_cm"), Loc) || FParse::Param(FCommandLine::Get(), TEXT("TwinNoRoomLights")))
 		{
-			continue;
+			continue;  // -TwinNoRoomLights: sun and sky only (lighting checks)
 		}
 		APointLight* PL = W->SpawnActorDeferred<APointLight>(APointLight::StaticClass(), FTransform(Loc - FVector(0, 0, 45.0)));
 		if (!PL)
 		{
 			continue;
 		}
+		// The component is registered by the time SpawnActorDeferred returns, so plain field writes never reach
+		// the renderer (they would only appear after something re-created the light, e.g. hiding it): setters only.
+		// Shadows stay on: they keep each light inside its room and its floor (slabs, walls) and cost little here.
+		// Brightness: the build's lumens (proportional to room area) x RoomLightScale, close to the sun's level;
+		// the range covers at least the floor below the light.
 		UPointLightComponent* C = PL->PointLightComponent;
 		C->SetMobility(EComponentMobility::Movable);
-		C->IntensityUnits = ELightUnits::Lumens;
-		C->Intensity = (float)NumOr(L, TEXT("lumens"), 1500.0);
-		C->AttenuationRadius = (float)NumOr(L, TEXT("radius_cm"), 800.0);
-		C->LightColor = Color;
-		C->SourceRadius = 30.f;
-		C->SoftSourceRadius = 60.f;
-		C->CastShadows = false;  // dozens of shadowed point lights are too slow for a laptop; the sun casts shadows
+		C->SetIntensityUnits(ELightUnits::Lumens);
+		C->SetIntensity((float)NumOr(L, TEXT("lumens"), 1500.0) * RoomLightScale);
+		C->SetAttenuationRadius(FMath::Max((float)NumOr(L, TEXT("radius_cm"), 800.0), 350.f));
+		C->SetLightColor(Color);
+		C->SetSourceRadius(30.f);
+		C->SetSoftSourceRadius(60.f);
+		C->SetCastShadows(true);
 		PL->FinishSpawning(FTransform(Loc - FVector(0, 0, 45.0)));
+		const FString LightFloor = Str(L, TEXT("floor"));
+		if (!LightFloor.IsEmpty())
+		{
+			PL->Tags.Add(FName(*(TEXT("TwinFloor=") + LightFloor)));  // hidden with its floor in the cutaway view
+		}
 		Spawned.Add(PL);
 	}
 
@@ -1043,7 +1063,7 @@ void ATwinViewerDirector::ValidateBuild()
 	int32 Checked = 0, NFail = 0;
 	TSet<FString> Seen;
 	FBox ArchUnion(ForceInit);
-	int32 Floors = 0;
+	int32 RoomFloorCount = 0;
 	for (int32 i = 0; i < NodeActors.Num(); ++i)
 	{
 		AActor* A = NodeActors[i];
@@ -1057,7 +1077,7 @@ void ATwinViewerDirector::ValidateBuild()
 		if (Meta.IsValid() && Str(Meta, TEXT("kind")) != TEXT("furniture"))
 		{
 			ArchUnion += Got;
-			Floors += Str(Meta, TEXT("kind")) == TEXT("floor") ? 1 : 0;
+			RoomFloorCount += Str(Meta, TEXT("kind")) == TEXT("floor") ? 1 : 0;
 		}
 		if (!ExpectedBox[i].IsValid)
 		{
@@ -1107,7 +1127,7 @@ void ATwinViewerDirector::ValidateBuild()
 	R->SetArrayField(TEXT("missing"), Missing);
 	R->SetArrayField(TEXT("unmatched_nodes"), Unmatched);
 	R->SetNumberField(TEXT("rooms_expected"), RoomsById.Num());
-	R->SetNumberField(TEXT("rooms_with_floor"), Floors);
+	R->SetNumberField(TEXT("rooms_with_floor"), RoomFloorCount);
 	R->SetArrayField(TEXT("building_bounds_expected_cm"), BoxJson(Expected));
 	R->SetArrayField(TEXT("building_bounds_got_cm"), BoxJson(ArchUnion));
 	R->SetNumberField(TEXT("building_bounds_deviation_cm"), BoundsDev);
@@ -1240,14 +1260,40 @@ void ATwinViewerDirector::FetchAirflow()
 			return;
 		}
 		Airflow = J;
-		if (!AirflowActor)
+		for (ATwinAirflowActor* A : AirflowActors)
 		{
-			AirflowActor = GetWorld()->SpawnActor<ATwinAirflowActor>(ATwinAirflowActor::StaticClass(), FTransform::Identity);
+			if (IsValid(A))
+			{
+				A->Destroy();
+			}
 		}
-		if (AirflowActor)
+		AirflowActors.Reset();
+		// one illustration per floor, placed at the floor's offset: its zones stay in floor-local cm
+		auto Spawn = [this](const TSharedPtr<FJsonObject>& Data, const FVector& Offset, const FString& Prefix, const FString& Floor)
 		{
-			AirflowActor->Build(J, this);
+			ATwinAirflowActor* A = GetWorld()->SpawnActor<ATwinAirflowActor>(ATwinAirflowActor::StaticClass(), FTransform(Offset));
+			if (A)
+			{
+				A->Build(Data, this, Prefix, Floor);
+				AirflowActors.Add(A);
+			}
+		};
+		const TArray<TSharedPtr<FJsonValue>>* PerFloor = nullptr;
+		if (J->TryGetArrayField(TEXT("floors"), PerFloor) && PerFloor->Num() > 0)
+		{
+			for (const TSharedPtr<FJsonValue>& V : *PerFloor)
+			{
+				const TSharedPtr<FJsonObject> O = V->AsObject();
+				FVector Offset = FVector::ZeroVector;
+				Vec(O, TEXT("offset_cm"), Offset);
+				Spawn(O->GetObjectField(TEXT("airflow")), Offset, Str(O, TEXT("unit_prefix")), Str(O, TEXT("floor")));
+			}
 		}
+		else
+		{
+			Spawn(J, FVector::ZeroVector, FString(), FString());
+		}
+		AirflowActor = AirflowActors.Num() ? AirflowActors[0].Get() : nullptr;
 	}, [this, Serial](const FString& Code, const FString& Message)
 	{
 		if (Serial == RequestSerial)
@@ -1259,15 +1305,161 @@ void ATwinViewerDirector::FetchAirflow()
 
 void ATwinViewerDirector::SetAirflowVisible(bool bVisible)
 {
-	if (AirflowActor)
+	for (ATwinAirflowActor* A : AirflowActors)
 	{
-		AirflowActor->SetShown(bVisible);
+		if (A)
+		{
+			A->SetShown(bVisible);
+		}
 	}
 }
 
 bool ATwinViewerDirector::IsAirflowVisible() const
 {
-	return AirflowActor && AirflowActor->IsShown();
+	for (const ATwinAirflowActor* A : AirflowActors)
+	{
+		if (A && A->IsShown())
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
+ATwinAirflowActor* ATwinViewerDirector::AirflowForFloor(int32 FloorIndex) const
+{
+	if (Floors.IsValidIndex(FloorIndex))
+	{
+		for (ATwinAirflowActor* A : AirflowActors)
+		{
+			if (A && A->FloorKey() == Floors[FloorIndex].Key)
+			{
+				return A;
+			}
+		}
+		return IsMultiFloor() ? nullptr : AirflowActor.Get();
+	}
+	return AirflowActor.Get();
+}
+
+// ------------------------------------------------------------------------------------------------
+// floors
+// ------------------------------------------------------------------------------------------------
+
+void ATwinViewerDirector::ReadFloors()
+{
+	Floors.Reset();
+	auto Start = [](const TSharedPtr<FJsonObject>& PS, FTwinFloor& F)
+	{
+		if (PS.IsValid())
+		{
+			Vec(PS, TEXT("location_cm"), F.PlayerStart);
+			F.PlayerYaw = (float)NumOr(PS, TEXT("yaw_deg"), 0.0);
+			F.PlayerRoom = Str(PS, TEXT("room_id"));
+		}
+	};
+	const TArray<TSharedPtr<FJsonValue>>* FJ = nullptr;
+	if (Manifest->TryGetArrayField(TEXT("floors"), FJ) && FJ->Num() > 0)
+	{
+		for (const TSharedPtr<FJsonValue>& V : *FJ)
+		{
+			const TSharedPtr<FJsonObject> O = V->AsObject();
+			FTwinFloor& F = Floors.AddDefaulted_GetRef();
+			F.Key = Str(O, TEXT("key"));
+			F.Label = Str(O, TEXT("label"));
+			F.ProjectName = Str(O, TEXT("project_name"));
+			F.FloorZ = (float)NumOr(O, TEXT("floor_z_cm"), 0.0);
+			Vec(O, TEXT("offset_cm"), F.Offset);
+			F.Bounds = BoxField(O, TEXT("bounds_cm"));
+			Start(O->GetObjectField(TEXT("player_start")), F);
+		}
+		Floors.Sort([](const FTwinFloor& A, const FTwinFloor& B) { return A.FloorZ < B.FloorZ; });
+		return;
+	}
+	FTwinFloor& F = Floors.AddDefaulted_GetRef();
+	F.Label = Launch.ProjectName;
+	F.ProjectName = Launch.ProjectName;
+	F.Bounds = BoxField(Manifest, TEXT("bounds_cm"));
+	Start(Manifest->GetObjectField(TEXT("player_start")), F);
+	F.FloorZ = (float)F.PlayerStart.Z;
+}
+
+int32 ATwinViewerDirector::FloorIndexOf(const FString& Key) const
+{
+	return Floors.IndexOfByPredicate([&Key](const FTwinFloor& F) { return F.Key == Key; });
+}
+
+int32 ATwinViewerDirector::FloorIndexAt(float Z) const
+{
+	int32 Best = Floors.Num() ? 0 : INDEX_NONE;
+	for (int32 i = 1; i < Floors.Num(); ++i)
+	{
+		if (Z >= Floors[i].FloorZ - 100.f)  // within a metre below a floor finish (its slab): already that floor
+		{
+			Best = i;
+		}
+	}
+	return Best;
+}
+
+FTwinFloorSpot ATwinViewerDirector::FloorSpot(int32 FloorIndex, const FVector2D& XY) const
+{
+	FTwinFloorSpot S;
+	if (!Floors.IsValidIndex(FloorIndex))
+	{
+		return S;
+	}
+	const FTwinFloor& F = Floors[FloorIndex];
+	S.Fallback = F.PlayerStart;
+	S.Method = TEXT("floor entrance");
+	double BestStair = TNumericLimits<double>::Max();
+	for (const auto& Pair : RoomsById)
+	{
+		const TSharedPtr<FJsonObject>& R = Pair.Value;
+		if (Str(R, TEXT("floor")) != F.Key)
+		{
+			continue;
+		}
+		FVector Spawn = F.PlayerStart;
+		Vec(R, TEXT("spawn_cm"), Spawn);
+		TArray<FVector2D> Poly;
+		for (const TSharedPtr<FJsonValue>& PV : R->GetArrayField(TEXT("polygon_cm")))
+		{
+			const TArray<TSharedPtr<FJsonValue>>& P = PV->AsArray();
+			if (P.Num() >= 2)
+			{
+				Poly.Add(FVector2D(P[0]->AsNumber(), P[1]->AsNumber()));
+			}
+		}
+		bool bIn = false;
+		for (int32 i = 0, j = Poly.Num() - 1; i < Poly.Num(); j = i++)
+		{
+			if ((Poly[i].Y > XY.Y) != (Poly[j].Y > XY.Y) &&
+				XY.X < (Poly[j].X - Poly[i].X) * (XY.Y - Poly[i].Y) / (Poly[j].Y - Poly[i].Y) + Poly[i].X)
+			{
+				bIn = !bIn;
+			}
+		}
+		if (bIn)
+		{
+			S.Same = FVector(XY.X, XY.Y, NumOr(R, TEXT("floor_z_cm"), F.FloorZ));
+			S.bSameValid = true;
+			S.Fallback = Spawn;
+			S.RoomName = Str(R, TEXT("name"));
+			S.Method = TEXT("same spot");
+			return S;
+		}
+		const FString Name = Str(R, TEXT("name")).ToLower() + TEXT(" ") + Str(R, TEXT("type")).ToLower();
+		const double D2 = FVector2D::DistSquared(FVector2D(Spawn.X, Spawn.Y), XY);
+		if ((Name.Contains(TEXT("stair")) || Name.Contains(TEXT("lift")) || Name.Contains(TEXT("elevator"))) && D2 < BestStair)
+		{
+			BestStair = D2;
+			S.Fallback = Spawn;
+			S.RoomName = Str(R, TEXT("name"));
+			S.Method = TEXT("stair or lift");
+		}
+	}
+	return S;
 }
 
 TSharedPtr<FJsonObject> ATwinViewerDirector::ObjectMeta(const FString& Name) const

@@ -29,6 +29,7 @@ COLLECTIONS = {
     "sensors": ("sensors",),
 }
 MAX_OPERATIONS = 60
+LEVELLED = {"rooms", "walls", "hvac_units", "hvac_terminals", "ducts", "sensors"}   # entities with a level_id field
 
 SYSTEM_FIX = """\
 You correct a 3D digital-twin scene model when the user tells you what is wrong. The scene is the single
@@ -168,8 +169,8 @@ def apply_operations(scene: Scene, ops: list[dict], prompt: str) -> tuple[dict, 
             if any(el.get("id") == payload["id"] for el in coll):
                 errors.append(f"operation {i}: {name} id '{payload['id']}' already exists")
                 continue
-            if "level_id" not in payload and name not in ("levels", "materials") and data["levels"]:
-                payload["level_id"] = data["levels"][0]["id"]
+            if "level_id" not in payload and name in LEVELLED and data["levels"]:
+                payload["level_id"] = data["levels"][0]["id"]   # openings / furniture hang off a wall / room instead
             coll.append(payload)
             _mark(payload, name, note)
         else:

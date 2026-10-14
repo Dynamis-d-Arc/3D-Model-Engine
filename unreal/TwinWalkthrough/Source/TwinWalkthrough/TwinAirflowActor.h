@@ -35,11 +35,19 @@ class TWINWALKTHROUGH_API ATwinAirflowActor : public AActor
 public:
 	ATwinAirflowActor();
 
-	void Build(const TSharedPtr<FJsonObject>& Airflow, ATwinViewerDirector* InDirector);
+	/** Airflow of one floor; a multi-floor building places one actor per floor at the floor's offset (the zones
+	 * stay floor-local) and its telemetry ids carry the floor prefix (F2_U_...). */
+	void Build(const TSharedPtr<FJsonObject>& Airflow, ATwinViewerDirector* InDirector, const FString& InUnitPrefix = FString(),
+	           const FString& InFloorKey = FString());
 	void Clear();
 	void SetShown(bool bInShown);
 	bool IsShown() const { return bShown; }
 	void SetMistShown(bool bInShown);
+	/** Hidden with its floor (the cutaway view of a multi-floor building), whatever V says. */
+	void SetFloorHidden(bool bInHidden);
+	const FString& FloorKey() const { return Floor; }
+	/** The MATLAB thermal model's state served with this floor's airflow (may be invalid). */
+	TSharedPtr<FJsonObject> ThermalState() const { return Thermal; }
 	bool IsMistShown() const { return bMistShown; }
 	int32 NumPaths() const { return Paths.Num(); }
 	int32 NumDots() const { return Xf.Num(); }
@@ -105,6 +113,9 @@ private:
 	float SplitX = 0.f;
 	TSharedPtr<FJsonObject> Thermal;
 	FString DriverName = TEXT("none");
+	FString UnitPrefix;
+	FString Floor;
+	bool bFloorHidden = false;
 	TWeakObjectPtr<ATwinViewerDirector> Director;
 	double Clock = 0.0;
 	double LastTelemetry = -1.0;

@@ -31,7 +31,7 @@ These are covered by `tests/test_transforms.py` and verified inside Unreal by th
 |---|---|
 | `project` | name, description, style (`modern`, `minimalist`, `industrial`, `luxury`, `scandinavian`), prompt |
 | `levels[]` | id, elevation, wall_height, slab_thickness, ceilings |
-| `rooms[]` | id, name, type, level_id, polygon (centreline, CCW), floor_offset, ceiling_height, finishes {floor, walls, ceiling, dado + dado_height, frieze + frieze_from} |
+| `rooms[]` | id, name, type, level_id, polygon (centreline, CCW), floor_offset, ceiling_height, finishes {floor, walls, ceiling, dado + dado_height, frieze + frieze_from}, open_plan (edges without a wall are intentional: no `W_ROOM_EDGE_NO_WALL`) |
 | `walls[]` | id, level_id, start, end, thickness, height (null = level), kind exterior/interior, material |
 | `openings[]` | id, kind door/window/opening, wall_id, offset (centre distance from wall start), width, height, sill_height, hinge_side start/end, opens_into |
 | `furniture[]` | id, asset_id (catalog), room_id, position, elevation (omitted = the asset's `default_elevation`, e.g. 2.0 m for an exhaust hood), rotation_deg, size (null = catalog), materials {role: material}, label |

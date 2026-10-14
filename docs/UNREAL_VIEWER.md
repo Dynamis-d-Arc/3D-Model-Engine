@@ -93,19 +93,41 @@ kept. The same numbers are checked twice:
 1. **server pre-flight** (Python, `twin/viewer/bundle.py`): glTF node boxes vs the scene model;
 2. **in Unreal** after spawning (`ATwinViewerDirector::ValidateBuild`): every actor's world bounds vs the
    manifest's scene-model bounds, every manifest object present, every room has a floor, the building's
-   overall bounds — written to `Saved/TwinViewer/validation_<build>.json` and shown in the HUD
-   ("Model check: N objects match the floor plan").
+   overall bounds — written to `Saved/TwinViewer/validation_<build>.json` and shown in the HUD's technical
+   details (**I**: "Model check: N objects match the floor plan"); a failed check also shows a plain warning by
+   default ("3 objects are not where the plan says (press I)").
 
 ## What the walkthrough does
 
 * First-person walk / fly / ghost, capsule collision against walls, doors frames, glass and furniture
   boxes; HVAC elements are selectable but never block; click-to-walk on a runtime nav mesh (the viewer
   level's NavMeshBoundsVolume is moved and scaled over each loaded building).
+* Mouse look reads the raw mouse counts (not the engine's look axes, which scale them by 0.07 and the field of
+  view and smooth them over frames — that made turning slow and laggy). Default 0.07° per count, about 5,100
+  counts per full turn (16 cm of mouse travel at 800 DPI). **[ / ]** (or **- / =**) changes it in ×1.25 steps
+  from 0.2× to 5×; the desktop viewer keeps the setting in its `GameUserSettings.ini` (`[TwinViewer]
+  LookSensitivity`), a streamed session keeps it for that session only. `-TwinLookSensitivity=<x>` sets it at
+  start. Arrow keys turn at a fixed 90°/s (yaw) and 60°/s (pitch).
+* **HUD for non-technical visitors** (`ATwinHUD`, canvas only — no extra fonts or textures to cook). Top left:
+  building, room, "6.25 × 4.25 m · 26.6 m²", flooring as a readable name ("oak_planks" → "Oak planks", or the
+  material's display name when the metadata has one), the storey of a multi-floor building and the movement
+  mode (Walking / Flying / Flying through walls). Developer information — model check numbers, the HVAC data
+  source and unit counts, room / material / build ids, object names — appears only with **I** (technical
+  details); a failed model check or a broken / stale HVAC feed still shows a short warning line by default.
+  Notifications are centred at the top, below any panel they would cover. Bottom centre: a one-line hint bar
+  (WASD move · Mouse look · M rooms, plus PgUp / PgDn floors, V airflow, X clear selection when they apply ·
+  H all controls); **H** opens the full controls card (Move, Look, Explore, Views, Other, keys drawn as key caps,
+  with the current mouse sensitivity). The card opens by itself for 10 s after a building loads, until the
+  visitor first presses H. Streaming mode lists Esc as "free the mouse" and has no screenshot / launch code /
+  quit entries.
 * Room name, clear size, area and floor finish of the room you stand in; **M** room list (click to go),
   **Tab** / **1–9** jump.
-* Click any object: furniture (asset, size, room) or HVAC equipment: tag, unit, design airflow and the
-  latest reading — labelled **LIVE BMS (measured)** or **SIMULATED BMS – demonstration, not measured**,
-  with its age; a broken feed keeps the last reading and says so.
+* Click any object: a plain type name ("Air-conditioning unit (ceiling cassette)", "Air outlet (diffuser)",
+  "Supply-air duct", "Furniture", "Sensor", ...), the room, size, and for HVAC equipment the unit it belongs to,
+  the design airflow and the latest reading ("Running · cooling · set to 24 °C", supply / return air, fan,
+  airflow) — labelled **LIVE BMS (measured)** or **SIMULATED BMS – demonstration, not measured** (a multi-floor
+  building with both says which applies to the object's floor), with its age; a broken feed keeps the last
+  reading and says so. Raw ids and the object name are in the technical details (**I**).
 * **V** airflow illustration, the same design as the web **Live** tab (ported from its
   `frontend/js/airflow/illustration.js`, `school-flow.js`, `thermal.js`):
   * **mist** — per unit a box (±3 m, floor to ceiling) raymarched by `M_TwinMist` in 16 steps: the zone's air
@@ -122,6 +144,7 @@ kept. The same numbers are checked twice:
   names what drives the mist and shows the MATLAB thermal model's west/east zone temperatures as *simulation*.
   Look tuning without a repackage: `-TwinMistGain=` (brightness, default 1.15), `-TwinMistDensity=` (1),
   `-TwinMistDots=` (dots per loop, 8).
+* **PgUp / PgDn** next floor up / down in a multi-floor building (see [MULTI_FLOOR.md](MULTI_FLOOR.md)).
 * **B** buildings list (switch model without restarting), **Ctrl+V** paste a launch code, **R** retry,
   **P** screenshot.
 
@@ -146,6 +169,15 @@ per-user buildings — is excluded), 4. adds `Open Twin Viewer.cmd`, `README.txt
 fails if any is found. Output: `dist/TwinViewer/Windows/` (git-ignored). `--config Shipping` builds the
 release flavour (no console, smaller); `--zip` also writes a zip.
 
+## Launching on this PC
+
+When the web app runs in a browser on the same computer as the backend, **Generate & preview → Unreal Engine 5 →
+Open on this PC** (and the same button on a multi-floor building) starts the packaged viewer directly: the
+backend launches `TWIN_DESKTOP_VIEWER_EXE`, else `dist/TwinViewerShipping`, else `dist/TwinViewer`, with a fresh
+read-only token in a file that is deleted after two minutes (`twin/viewer/local.py`). The route only accepts requests
+from 127.0.0.1 / ::1 without proxy headers and is off when `TWIN_PUBLIC_URL` is set, so a server reachable from the
+network never starts programs for visitors; they use the launch file below.
+
 ## Launching (another person)
 
 1. Copy the `Windows` folder (or the zip) to their PC. If Windows reports missing runtime DLLs, run
@@ -169,7 +201,8 @@ PCs, put it behind a reverse proxy with TLS and set `TWIN_PUBLIC_URL` so launch 
 `<dir>/tour_report.json`: the load timings and in-engine validation, inventory, nav path + reachability
 from the player-start room, click-to-walk arrival, wall collision, furniture selection, HVAC unit selection +
 telemetry identity matching, the airflow layer (paths, dots, mist zones / driver / temperatures, disclaimer, MATLAB state; `airflow.png` in
-the unit's room and `airflow_above.png` from above), the optional model
+the unit's room and `airflow_above.png` from above), the HUD (`help.png` with the controls card,
+`hvac_details.png` with the technical details; every other shot shows the hint bar), the optional model
 switch, screenshots, average fps — and exits (code 3 when the building cannot be loaded; the report then
 holds `load_error`). `tests/viewer_harness.py` drives it.
 
@@ -202,7 +235,8 @@ Shipping package: 382 MB; average 78–84 fps during the scripted tours.
 
 * Procedural mesh components are drawn without Nanite and without mesh distance fields, so Lumen GI is
   screen-space only; room point lights do not cast shadows (performance on laptops).
-* No multi-level buildings yet (the scene model has one level per build).
+* Multi-floor buildings are stacks of floor projects ([MULTI_FLOOR.md](MULTI_FLOOR.md)); the floors are not connected for
+  walking (no stair geometry yet): PgUp / PgDn jump between them.
 * The airflow layer is an illustration by design; there is no CFD in the viewer. As on the web, a unit's mist
   zone is a ±3 m box around it: it stops at the wall you look at but is not cut to the unit's room, and the
   web Live tab's room isolation and MATLAB timeline are not in the viewer.

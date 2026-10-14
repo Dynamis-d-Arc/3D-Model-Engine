@@ -2,16 +2,25 @@
 
 #include "Blueprint/AIBlueprintHelperLibrary.h"
 #include "Camera/CameraComponent.h"
+#include "Components/CapsuleComponent.h"
 #include "Dom/JsonObject.h"
+#include "Engine/GameViewportClient.h"
+#include "Engine/LocalPlayer.h"
 #include "Engine/World.h"
 #include "EngineUtils.h"
+#include "Engine/PointLight.h"
+#include "Components/PointLightComponent.h"
 #include "Framework/Application/IInputProcessor.h"
 #include "Framework/Application/SlateApplication.h"
 #include "GameFramework/CharacterMovementComponent.h"
+#include "GameFramework/PlayerInput.h"
+#include "GenericPlatform/GenericPlatformInputDeviceMapper.h"
 #include "HAL/FileManager.h"
 #include "HAL/PlatformApplicationMisc.h"
+#include "InputKeyEventArgs.h"
 #include "Kismet/KismetMathLibrary.h"
 #include "Misc/CommandLine.h"
+#include "Misc/ConfigCacheIni.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
 #include "NavigationData.h"
@@ -59,6 +68,13 @@ namespace
 			O->SetNumberField(Key, V);
 		}
 	}
+
+	// mouse sensitivity setting (GameUserSettings.ini of the desktop viewer)
+	const TCHAR* LookIniSection = TEXT("TwinViewer");
+	const TCHAR* LookIniKey = TEXT("LookSensitivity");
+	constexpr float MinLookSensitivity = 0.2f;
+	constexpr float MaxLookSensitivity = 5.f;
+	constexpr float LookSensitivityStep = 1.25f;
 }
 
 void ATwinPlayerController::BeginPlay()
@@ -98,6 +114,13 @@ void ATwinPlayerController::BeginPlay()
 		IFileManager::Get().MakeDirectory(*TourOut, true);
 		bShowHelp = false;
 	}
+	// mouse sensitivity: -TwinLookSensitivity=<x>, else the one saved by [ / ] (desktop; tours stay at the default)
+	if (!bStreaming && !bTour)
+	{
+		GConfig->GetFloat(LookIniSection, LookIniKey, LookSensitivity, GGameUserSettingsIni);
+	}
+	FParse::Value(Cmd, TEXT("TwinLookSensitivity="), LookSensitivity);
+	LookSensitivity = FMath::Clamp(LookSensitivity, MinLookSensitivity, MaxLookSensitivity);
 	if (ATwinViewerDirector* D = Director.Get())
 	{
 		// runtime viewer: actors arrive later; hold the visitor until the building exists
@@ -116,7 +139,8 @@ void ATwinPlayerController::BeginPlay()
 	}
 	else
 	{
-		Notify(FString::Printf(TEXT("%d rooms loaded. H for help."), RoomFloors.Num()), 5.f);
+		ShowHelpForAWhile();
+		Notify(FString::Printf(TEXT("%d rooms loaded"), RoomFloors.Num()), 5.f);
 	}
 }
 
@@ -152,6 +176,7 @@ void ATwinPlayerController::OnTwinLoaded()
 	Selected.Reset();
 	CurrentRoomFloor.Reset();
 	bCeilingsVisible = true;
+	CurrentFloor = 0;
 	CloseMenu();
 	ATwinViewerDirector* D = Director.Get();
 	ATwinCharacter* C = TwinPawn();
@@ -169,7 +194,8 @@ void ATwinPlayerController::OnTwinLoaded()
 			SetControlRotation(FRotator(0.f, (float)PS->GetNumberField(TEXT("yaw_deg")), 0.f));
 		}
 	}
-	Notify(FString::Printf(TEXT("%s: %d rooms loaded. H for help."), D ? *D->Launch.ProjectName : TEXT("Building"), RoomFloors.Num()), 6.f);
+	Notify(FString::Printf(TEXT("%s: %d rooms loaded"), D ? *D->Launch.ProjectName : TEXT("Building"), RoomFloors.Num()), 6.f);
+	ShowHelpForAWhile();
 	if (bTourWaitingForLoad)
 	{
 		bTourWaitingForLoad = false;
@@ -219,9 +245,24 @@ FString ATwinPlayerController::ModeName() const
 	}
 	if (C->IsGhost())
 	{
-		return TEXT("Ghost (no collision)");
+		return TEXT("Flying through walls");
 	}
-	return C->IsFlying() ? TEXT("Fly") : TEXT("Walk");
+	return C->IsFlying() ? TEXT("Flying") : TEXT("Walking");
+}
+
+void ATwinPlayerController::ShowHelpForAWhile()
+{
+	if (bTour || bHelpToggled)
+	{
+		return;
+	}
+	bShowHelp = true;
+	HelpAutoHideAt = GetWorld()->GetTimeSeconds() + HelpAutoSeconds;
+}
+
+double ATwinPlayerController::HelpSecondsLeft() const
+{
+	return HelpAutoHideAt > 0.0 ? FMath::Max(0.0, HelpAutoHideAt - GetWorld()->GetTimeSeconds()) : -1.0;
 }
 
 void ATwinPlayerController::EndPlay(const EEndPlayReason::Type Reason)
@@ -257,7 +298,36 @@ void ATwinPlayerController::LookDelta(float& MX, float& MY) const
 		MY = -FrameMouse.Y;  // Slate: +Y = down the screen; input axes: +Y = up
 		return;
 	}
-	GetInputMouseDelta(MX, MY);
+	// raw counts: GetInputMouseDelta scales them by 0.07 (BaseInput.ini) and the FOV, and smooths them over frames,
+	// which made the view slow and laggy to turn
+	MX = PlayerInput ? PlayerInput->GetRawKeyValue(EKeys::MouseX) : 0.f;
+	MY = PlayerInput ? PlayerInput->GetRawKeyValue(EKeys::MouseY) : 0.f;
+}
+
+void ATwinPlayerController::TickLook(float DeltaTime)
+{
+	float MX = 0.f, MY = 0.f;
+	LookDelta(MX, MY);
+	const float DegPerCount = BaseLookDegPerCount * LookSensitivity;
+	const float KeyYaw = (IsInputKeyDown(EKeys::Right) ? 1.f : 0.f) - (IsInputKeyDown(EKeys::Left) ? 1.f : 0.f);
+	const float KeyPitch = (IsInputKeyDown(EKeys::Up) ? 1.f : 0.f) - (IsInputKeyDown(EKeys::Down) ? 1.f : 0.f);
+	ApplyLook(MX * DegPerCount + KeyYaw * 90.f * DeltaTime, MY * DegPerCount + KeyPitch * 60.f * DeltaTime);
+}
+
+void ATwinPlayerController::StepLookSensitivity(int32 Steps)
+{
+	LookSensitivity = FMath::Clamp(LookSensitivity * FMath::Pow(LookSensitivityStep, (float)Steps), MinLookSensitivity,
+	                               MaxLookSensitivity);
+	if (FMath::IsNearlyEqual(LookSensitivity, 1.f, 0.01f))
+	{
+		LookSensitivity = 1.f;
+	}
+	if (!bStreaming && !bTour)   // streamed: a shared server, so the setting lasts for this session only
+	{
+		GConfig->SetFloat(LookIniSection, LookIniKey, LookSensitivity, GGameUserSettingsIni);
+		GConfig->Flush(false, GGameUserSettingsIni);
+	}
+	Notify(FString::Printf(TEXT("Mouse sensitivity %.2fx  ([ slower / ] faster)"), LookSensitivity));
 }
 
 double ATwinPlayerController::IdleSecondsLeft() const
@@ -327,6 +397,11 @@ void ATwinPlayerController::PlayerTick(float DeltaTime)
 	{
 		HoldPawn();
 	}
+	if (HelpAutoHideAt > 0.0 && GetWorld()->GetTimeSeconds() >= HelpAutoHideAt)
+	{
+		bShowHelp = false;   // the controls card shown after a load folds back into the hint bar
+		HelpAutoHideAt = 0.0;
+	}
 	if (bTour)
 	{
 		TickTour(DeltaTime);
@@ -340,6 +415,7 @@ void ATwinPlayerController::PlayerTick(float DeltaTime)
 		HandleInput(DeltaTime);
 	}
 	UpdateCurrentRoom();
+	SyncFloor();
 }
 
 void ATwinPlayerController::TakeScreenshot()
@@ -507,6 +583,14 @@ void ATwinPlayerController::HandleInput(float DeltaTime)
 			A->SetMistShown(!A->IsMistShown());
 			Notify(A->IsMistShown() ? TEXT("Temperature mist on") : TEXT("Temperature mist off (tracers only)"));
 		}
+		if (WasInputKeyJustPressed(EKeys::PageUp))
+		{
+			JumpFloor(1);
+		}
+		if (WasInputKeyJustPressed(EKeys::PageDown))
+		{
+			JumpFloor(-1);
+		}
 	}
 	ATwinCharacter* C = TwinPawn();
 	if (!C)
@@ -541,11 +625,17 @@ void ATwinPlayerController::HandleInput(float DeltaTime)
 	}
 	C->AddMovementInput(FRotationMatrix(Yaw).GetUnitAxis(EAxis::Y), Right);
 
-	float MX = 0.f, MY = 0.f;
-	LookDelta(MX, MY);
-	const float KeyYaw = (IsInputKeyDown(EKeys::Right) ? 1.f : 0.f) - (IsInputKeyDown(EKeys::Left) ? 1.f : 0.f);
-	const float KeyPitch = (IsInputKeyDown(EKeys::Up) ? 1.f : 0.f) - (IsInputKeyDown(EKeys::Down) ? 1.f : 0.f);
-	ApplyLook(MX * LookDegPerCount + KeyYaw * 90.f * DeltaTime, MY * LookDegPerCount + KeyPitch * 60.f * DeltaTime);
+	TickLook(DeltaTime);
+	if (WasInputKeyJustPressed(EKeys::LeftBracket) || WasInputKeyJustPressed(EKeys::Hyphen) ||
+		WasInputKeyJustPressed(EKeys::Subtract))
+	{
+		StepLookSensitivity(-1);
+	}
+	if (WasInputKeyJustPressed(EKeys::RightBracket) || WasInputKeyJustPressed(EKeys::Equals) ||
+		WasInputKeyJustPressed(EKeys::Add))
+	{
+		StepLookSensitivity(1);
+	}
 
 	if (WasInputKeyJustPressed(EKeys::F))
 	{
@@ -570,6 +660,13 @@ void ATwinPlayerController::HandleInput(float DeltaTime)
 	if (WasInputKeyJustPressed(EKeys::H))
 	{
 		bShowHelp = !bShowHelp;
+		bHelpToggled = true;
+		HelpAutoHideAt = 0.0;
+	}
+	if (WasInputKeyJustPressed(EKeys::I))
+	{
+		bShowDetails = !bShowDetails;
+		Notify(bShowDetails ? TEXT("Technical details shown (I hides them)") : TEXT("Technical details hidden"));
 	}
 	if (WasInputKeyJustPressed(EKeys::X))
 	{
@@ -650,7 +747,7 @@ void ATwinPlayerController::WalkToCrosshair()
 	ATwinCharacter* C = TwinPawn();
 	if (C && C->IsFlying())
 	{
-		Notify(TEXT("Click-to-walk works in Walk mode (press F)"));
+		Notify(TEXT("Right click walks you there while walking (F stops flying)"));
 		return;
 	}
 	UNavigationSystemV1* NavSys = FNavigationSystem::GetCurrent<UNavigationSystemV1>(GetWorld());
@@ -711,6 +808,12 @@ void ATwinPlayerController::TeleportToRoom(int32 Index)
 	}
 	AActor* Floor = RoomFloors[Index].Get();
 	StopMovement();
+	const int32 RoomFloorIndex = FloorOfActor(Floor);
+	if (RoomFloorIndex != INDEX_NONE && RoomFloorIndex != CurrentFloor)
+	{
+		CurrentFloor = RoomFloorIndex;
+		ApplyFloorVisibility();
+	}
 	GetPawn()->SetActorLocation(RoomSpawn(Floor) + FVector(0, 0, ATwinCharacter::CapsuleHalfHeightCm + 5.f), false,
 	                            nullptr, ETeleportType::TeleportPhysics);
 	Notify(FString::Printf(TEXT("Room: %s"), *TwinMeta::Get(Floor, TEXT("RoomName"))));
@@ -727,6 +830,115 @@ void ATwinPlayerController::SetCeilingsVisible(bool bVisible)
 			It->SetActorEnableCollision(bVisible);  // hidden ceilings must not block selecting what is above them
 		}
 	}
+	ApplyFloorVisibility();
+}
+
+int32 ATwinPlayerController::FloorOfActor(const AActor* A) const
+{
+	const ATwinViewerDirector* D = Director.Get();
+	const FString Key = TwinMeta::Get(A, TEXT("Floor"));
+	return (D && !Key.IsEmpty()) ? D->FloorIndexOf(Key) : INDEX_NONE;
+}
+
+void ATwinPlayerController::ApplyFloorVisibility()
+{
+	// cutaway: with the ceilings hidden the visitor wants to look into the current floor, so the floors above go too
+	ATwinViewerDirector* D = Director.Get();
+	if (!D || !D->IsMultiFloor())
+	{
+		return;
+	}
+	const bool bCut = !bCeilingsVisible;
+	for (TActorIterator<AActor> It(GetWorld()); It; ++It)
+	{
+		const int32 F = FloorOfActor(*It);
+		if (F == INDEX_NONE)
+		{
+			continue;
+		}
+		const bool bVisible = !(bCut && F > CurrentFloor) && (bCeilingsVisible || !TwinMeta::IsKind(*It, TEXT("ceiling")));
+		if (It->IsHidden() == bVisible)
+		{
+			It->SetActorHiddenInGame(!bVisible);
+			It->SetActorEnableCollision(bVisible);  // hidden floors must not block selecting what is below them
+		}
+	}
+	for (ATwinAirflowActor* A : D->AirflowActors)
+	{
+		if (A)
+		{
+			A->SetFloorHidden(bCut && D->FloorIndexOf(A->FloorKey()) > CurrentFloor);
+		}
+	}
+}
+
+void ATwinPlayerController::SyncFloor()
+{
+	// walking: the floor under the visitor's feet (flying keeps the floor chosen with PgUp / PgDn)
+	const ATwinCharacter* C = TwinPawn();
+	if (!C || C->IsGhost() || C->IsFlying() || !CurrentRoomFloor.IsValid())
+	{
+		return;
+	}
+	const int32 F = FloorOfActor(CurrentRoomFloor.Get());
+	if (F != INDEX_NONE && F != CurrentFloor)
+	{
+		CurrentFloor = F;
+		ApplyFloorVisibility();
+	}
+}
+
+FString ATwinPlayerController::JumpFloor(int32 Direction)
+{
+	ATwinViewerDirector* D = Director.Get();
+	ATwinCharacter* C = TwinPawn();
+	if (!D || !C)
+	{
+		return FString();
+	}
+	if (!D->IsMultiFloor())
+	{
+		Notify(TEXT("This building has one floor"));
+		return FString();
+	}
+	const int32 From = FMath::Clamp(CurrentFloor, 0, D->Floors.Num() - 1);
+	const int32 To = From + Direction;
+	if (!D->Floors.IsValidIndex(To))
+	{
+		Notify(Direction > 0 ? TEXT("Already on the top floor") : TEXT("Already on the lowest floor"));
+		return FString();
+	}
+	StopMovement();
+	C->GetCharacterMovement()->StopMovementImmediately();
+	const FVector Here = C->GetActorLocation();
+	FString How;
+	if (C->IsGhost() || C->IsFlying())
+	{
+		// the same view one storey up / down
+		C->SetActorLocation(Here + FVector(0, 0, D->Floors[To].FloorZ - D->Floors[From].FloorZ), false, nullptr,
+		                    ETeleportType::TeleportPhysics);
+		How = TEXT("same view");
+	}
+	else
+	{
+		const FTwinFloorSpot Spot = D->FloorSpot(To, FVector2D(Here.X, Here.Y));
+		const FVector Up(0, 0, ATwinCharacter::CapsuleHalfHeightCm + 5.f);
+		FCollisionQueryParams Params(SCENE_QUERY_STAT(TwinFloorJump), false, C);
+		const FCollisionShape Capsule = FCollisionShape::MakeCapsule(C->GetCapsuleComponent()->GetScaledCapsuleRadius(),
+		                                                             ATwinCharacter::CapsuleHalfHeightCm);
+		FVector Dest = Spot.Fallback + Up;
+		How = Spot.Method == TEXT("same spot") ? FString(TEXT("room centre")) : Spot.Method;
+		if (Spot.bSameValid && !GetWorld()->OverlapAnyTestByChannel(Spot.Same + Up, FQuat::Identity, ECC_Pawn, Capsule, Params))
+		{
+			Dest = Spot.Same + Up;
+			How = TEXT("same spot");
+		}
+		C->SetActorLocation(Dest, false, nullptr, ETeleportType::TeleportPhysics);
+	}
+	CurrentFloor = To;
+	ApplyFloorVisibility();
+	Notify(FString::Printf(TEXT("%s (%d of %d)"), *D->Floors[To].Label, To + 1, D->Floors.Num()), 3.f);
+	return How;
 }
 
 void ATwinPlayerController::PlaceCamera(const FVector& EyeLocation, const FVector& LookAt)
@@ -809,6 +1021,26 @@ void ATwinPlayerController::StartTour()
 			ByKind->SetNumberField(Pair.Key, Pair.Value);
 		}
 		TourReport->SetNumberField(TEXT("twin_actors"), Total);
+		// room lights as spawned (lighting diagnosis)
+		int32 Lights = 0, LightsHidden = 0;
+		double Lumens = 0.0;
+		TMap<FString, int32> PerFloor;
+		for (TActorIterator<APointLight> It(GetWorld()); It; ++It)
+		{
+			++Lights;
+			LightsHidden += It->IsHidden() ? 1 : 0;
+			Lumens += It->PointLightComponent ? It->PointLightComponent->Intensity : 0.0;
+			PerFloor.FindOrAdd(TwinMeta::Get(*It, TEXT("Floor")))++;
+		}
+		TSharedPtr<FJsonObject> LJ = MakeShared<FJsonObject>();
+		LJ->SetNumberField(TEXT("point_lights"), Lights);
+		LJ->SetNumberField(TEXT("hidden"), LightsHidden);
+		LJ->SetNumberField(TEXT("lumens_total"), Lumens);
+		for (const auto& Pair : PerFloor)
+		{
+			LJ->SetNumberField(Pair.Key.IsEmpty() ? TEXT("untagged") : *Pair.Key, Pair.Value);
+		}
+		TourReport->SetObjectField(TEXT("lights"), LJ);
 		TourReport->SetObjectField(TEXT("by_kind"), ByKind);
 		TArray<TSharedPtr<FJsonValue>> Rooms;
 		for (const auto& F : RoomFloors)
@@ -881,7 +1113,15 @@ void ATwinPlayerController::StartTour()
 		TSharedPtr<FJsonObject> Nav = MakeShared<FJsonObject>();
 		UNavigationSystemV1* NavSys = FNavigationSystem::GetCurrent<UNavigationSystemV1>(GetWorld());
 		Nav->SetBoolField(TEXT("system"), NavSys != nullptr);
-		WalkRoom = RoomFloors.Num() - 1 == StartRoom ? RoomFloors.Num() - 2 : RoomFloors.Num() - 1;
+		// floors are not connected (no stairs to walk): the walk and the reachability stay on the start room's floor
+		const int32 StartFloor = RoomFloors.IsValidIndex(StartRoom) ? FloorOfActor(RoomFloors[StartRoom].Get()) : INDEX_NONE;
+		auto SameFloor = [this, StartFloor](int32 i) { return FloorOfActor(RoomFloors[i].Get()) == StartFloor; };
+		WalkRoom = INDEX_NONE;
+		for (int32 i = RoomFloors.Num() - 1; i >= 0 && WalkRoom == INDEX_NONE; --i)
+		{
+			WalkRoom = (i != StartRoom && SameFloor(i)) ? i : INDEX_NONE;
+		}
+		WalkRoom = WalkRoom == INDEX_NONE ? StartRoom : WalkRoom;
 		if (NavSys && RoomFloors.Num() >= 2)
 		{
 			const FVector A = RoomSpawn(RoomFloors[StartRoom].Get()) + FVector(0, 0, 50);
@@ -925,13 +1165,16 @@ void ATwinPlayerController::StartTour()
 			double Farthest = -1.0;
 			int32 FarIndex = INDEX_NONE, Reachable = 0;
 			TArray<int32> Order = {StartRoom};
+			int32 OtherFloors = 0;
 			for (int32 i = 0; i < RoomFloors.Num(); ++i)
 			{
-				if (i != StartRoom)
+				if (i != StartRoom && SameFloor(i))
 				{
 					Order.Add(i);
 				}
+				OtherFloors += SameFloor(i) ? 0 : 1;
 			}
+			Nav->SetNumberField(TEXT("rooms_on_other_floors"), OtherFloors);
 			for (const int32 i : Order)
 			{
 				const FVector T = RoomSpawn(RoomFloors[i].Get()) + FVector(0, 0, 50);
@@ -1056,6 +1299,45 @@ void ATwinPlayerController::StartTour()
 		return 0.2f;
 	});
 
+	// 4c) mouse look sensitivity: 100 counts right + 50 up, fed in where real mouse moves arrive (the player input
+	// stack on the desktop, the Slate pre-processor when streamed), turn the view by counts x deg/count
+	TourSteps.Add([this]() -> float
+	{
+		SetControlRotation(FRotator(0.f, 180.f, 0.f));
+		LookStart = GetControlRotation();
+		if (MouseProcessor.IsValid())
+		{
+			MouseProcessor->Accumulated += FVector2D(100.f, -50.f);   // Slate: +Y = down
+		}
+		else
+		{
+			FViewport* Viewport = GetLocalPlayer() && GetLocalPlayer()->ViewportClient ? GetLocalPlayer()->ViewportClient->Viewport : nullptr;
+			const FInputDeviceId Device = IPlatformInputDeviceMapper::Get().GetDefaultInputDevice();
+			const uint64 Now = FPlatformTime::Cycles64();
+			InputKey(FInputKeyEventArgs(Viewport, Device, EKeys::MouseX, 100.f, 1.f / 60.f, 1, Now));
+			InputKey(FInputKeyEventArgs(Viewport, Device, EKeys::MouseY, 50.f, 1.f / 60.f, 1, Now));
+		}
+		return 0.f;   // handed over on the next frame
+	});
+	TourSteps.Add([this]() -> float
+	{
+		TickLook(0.f);
+		const FRotator Now = GetControlRotation();
+		const float Yaw = FRotator::NormalizeAxis(Now.Yaw - LookStart.Yaw);
+		const float Pitch = FRotator::NormalizeAxis(Now.Pitch - LookStart.Pitch);
+		const float DegPerCount = BaseLookDegPerCount * LookSensitivity;
+		TSharedPtr<FJsonObject> Mouse = MakeShared<FJsonObject>();
+		Mouse->SetNumberField(TEXT("sensitivity"), LookSensitivity);
+		Mouse->SetNumberField(TEXT("deg_per_count"), DegPerCount);
+		Mouse->SetNumberField(TEXT("counts_per_turn"), 360.f / DegPerCount);
+		Mouse->SetNumberField(TEXT("yaw_turned_deg"), Yaw);
+		Mouse->SetNumberField(TEXT("pitch_turned_deg"), Pitch);
+		Mouse->SetBoolField(TEXT("ok"), FMath::IsNearlyEqual(Yaw, 100.f * DegPerCount, 0.05f) &&
+		                    FMath::IsNearlyEqual(Pitch, 50.f * DegPerCount, 0.05f));
+		TourReport->SetObjectField(TEXT("mouse_look"), Mouse);
+		return 0.2f;
+	});
+
 	// 5) one eye-level screenshot per room (from a corner, looking across the room); -TwinTourRooms=N limits them
 	int32 ShotRooms = RoomFloors.Num();
 	FParse::Value(FCommandLine::Get(), TEXT("TwinTourRooms="), ShotRooms);
@@ -1083,6 +1365,11 @@ void ATwinPlayerController::StartTour()
 			return 0.4f;
 		});
 	}
+
+	// 5b) the full controls card (H) over the last view; every other shot shows the one-line hint bar
+	TourSteps.Add([this]() -> float { bShowHelp = true; return 0.6f; });
+	TourSteps.Add([this]() -> float { Shot(TEXT("help")); return 0.4f; });
+	TourSteps.Add([this]() -> float { bShowHelp = false; return 0.1f; });
 
 	// 6) select a furniture item and show its info panel
 	TourSteps.Add([this]() -> float
@@ -1144,6 +1431,7 @@ void ATwinPlayerController::StartTour()
 	if (Director.IsValid())
 	{
 		AddViewerSteps();
+		AddFloorSteps();
 	}
 
 	// 7) overview from above with ceilings hidden (ghost mode)
@@ -1154,6 +1442,7 @@ void ATwinPlayerController::StartTour()
 		{
 			C->SetGhost(true);
 		}
+		CurrentFloor = Director.IsValid() ? FMath::Max(0, Director->Floors.Num() - 1) : 0;
 		SetCeilingsVisible(false);
 		FBox All(ForceInit);
 		for (const auto& F : RoomFloors)
@@ -1281,6 +1570,7 @@ void ATwinPlayerController::AddViewerSteps()
 		{
 			return 0.1f;
 		}
+		CurrentFloor = FMath::Max(0, FloorOfActor(Unit));  // multi-floor: the unit's floor (the cutaway hides the ones above)
 		SetCeilingsVisible(false);
 		if (ATwinCharacter* Ch = TwinPawn())
 		{
@@ -1377,6 +1667,17 @@ void ATwinPlayerController::AddViewerSteps()
 		}
 		return 0.5f;
 	});
+	// the same with the technical details (I): data source, ids, object name, model check numbers
+	TourSteps.Add([this]() -> float { bShowDetails = TourHvac.IsValid(); return 0.4f; });
+	TourSteps.Add([this]() -> float
+	{
+		if (TourHvac.IsValid())
+		{
+			Shot(TEXT("hvac_details"));
+		}
+		return 0.4f;
+	});
+	TourSteps.Add([this]() -> float { bShowDetails = false; return 0.1f; });
 
 	// airflow illustration: switch it on, look across the unit's room, record what is drawn and how it is labelled
 	TourSteps.Add([this]() -> float
@@ -1386,6 +1687,8 @@ void ATwinPlayerController::AddViewerSteps()
 		{
 			return 0.1f;
 		}
+		CurrentFloor = FMath::Max(0, FloorOfActor(TourHvac.Get()));
+		ApplyFloorVisibility();
 		D->SetAirflowVisible(true);
 		Selected.Reset();
 		const FVector U = TourHvac->GetComponentsBoundingBox(true).GetCenter();
@@ -1406,26 +1709,60 @@ void ATwinPlayerController::AddViewerSteps()
 		ATwinViewerDirector* D = Director.Get();
 		TSharedPtr<FJsonObject> A = MakeShared<FJsonObject>();
 		A->SetBoolField(TEXT("visible"), D && D->IsAirflowVisible());
-		if (D && D->AirflowActor)
+		if (D && D->AirflowActors.Num())
 		{
-			A->SetNumberField(TEXT("paths"), D->AirflowActor->NumPaths());
-			A->SetNumberField(TEXT("dots"), D->AirflowActor->NumDots());
-			A->SetNumberField(TEXT("dots_moving"), D->AirflowActor->VisibleDots());
-			A->SetNumberField(TEXT("units"), D->AirflowActor->NumUnits());
-			ATwinAirflowActor* Af = D->AirflowActor;
-			TSharedPtr<FJsonObject> M = MakeShared<FJsonObject>();
-			M->SetBoolField(TEXT("material"), Af->HasMistMaterial());
-			M->SetBoolField(TEXT("params_ok"), Af->MistParamsOk());
-			M->SetNumberField(TEXT("zones"), Af->NumMistZones());
-			M->SetNumberField(TEXT("visible"), Af->VisibleMistZones());
-			M->SetStringField(TEXT("driver"), Af->Driver());
-			M->SetNumberField(TEXT("mask_w"), Af->MaskSize().X);
-			M->SetNumberField(TEXT("mask_h"), Af->MaskSize().Y);
-			const FVector2D Range = Af->TemperatureRange();
-			if (!FMath::IsNaN(Range.X))
+			// summed over the floors' illustrations (one actor per floor with HVAC in a multi-floor building)
+			int32 Paths = 0, Dots = 0, Moving = 0, Units = 0, Zones = 0, Shown = 0, MaskW = 0, MaskH = 0;
+			bool bMaterial = true, bParams = true;
+			float Lo = TNumericLimits<float>::Max(), Hi = -TNumericLimits<float>::Max();
+			TArray<TSharedPtr<FJsonValue>> PerFloor;
+			for (ATwinAirflowActor* Af : D->AirflowActors)
 			{
-				M->SetNumberField(TEXT("temp_min_c"), Range.X);
-				M->SetNumberField(TEXT("temp_max_c"), Range.Y);
+				if (!Af)
+				{
+					continue;
+				}
+				Paths += Af->NumPaths();
+				Dots += Af->NumDots();
+				Moving += Af->VisibleDots();
+				Units += Af->NumUnits();
+				Zones += Af->NumMistZones();
+				Shown += Af->VisibleMistZones();
+				MaskW = FMath::Max(MaskW, Af->MaskSize().X);
+				MaskH = FMath::Max(MaskH, Af->MaskSize().Y);
+				bMaterial &= Af->HasMistMaterial();
+				bParams &= Af->MistParamsOk();
+				const FVector2D Range = Af->TemperatureRange();
+				if (!FMath::IsNaN(Range.X))
+				{
+					Lo = FMath::Min(Lo, (float)Range.X);
+					Hi = FMath::Max(Hi, (float)Range.Y);
+				}
+				TSharedPtr<FJsonObject> F = MakeShared<FJsonObject>();
+				F->SetStringField(TEXT("floor"), Af->FloorKey());
+				F->SetNumberField(TEXT("units"), Af->NumUnits());
+				F->SetNumberField(TEXT("mist_visible"), Af->VisibleMistZones());
+				F->SetStringField(TEXT("driver"), Af->Driver());
+				F->SetArrayField(TEXT("offset_cm"), VecJson(Af->GetActorLocation()));
+				PerFloor.Add(MakeShared<FJsonValueObject>(F));
+			}
+			A->SetNumberField(TEXT("paths"), Paths);
+			A->SetNumberField(TEXT("dots"), Dots);
+			A->SetNumberField(TEXT("dots_moving"), Moving);
+			A->SetNumberField(TEXT("units"), Units);
+			A->SetArrayField(TEXT("floors"), PerFloor);
+			TSharedPtr<FJsonObject> M = MakeShared<FJsonObject>();
+			M->SetBoolField(TEXT("material"), bMaterial);
+			M->SetBoolField(TEXT("params_ok"), bParams);
+			M->SetNumberField(TEXT("zones"), Zones);
+			M->SetNumberField(TEXT("visible"), Shown);
+			M->SetStringField(TEXT("driver"), D->AirflowActor ? D->AirflowActor->Driver() : FString());
+			M->SetNumberField(TEXT("mask_w"), MaskW);
+			M->SetNumberField(TEXT("mask_h"), MaskH);
+			if (Lo <= Hi)
+			{
+				M->SetNumberField(TEXT("temp_min_c"), Lo);
+				M->SetNumberField(TEXT("temp_max_c"), Hi);
 			}
 			A->SetObjectField(TEXT("mist"), M);
 		}
@@ -1455,6 +1792,7 @@ void ATwinPlayerController::AddViewerSteps()
 		{
 			C->SetGhost(true);
 		}
+		CurrentFloor = FMath::Max(0, FloorOfActor(TourHvac.Get()));
 		SetCeilingsVisible(false);
 		FBox B = TourHvac->GetComponentsBoundingBox(true).ExpandBy(400.f);
 		for (const auto& F : RoomFloors)
@@ -1470,9 +1808,11 @@ void ATwinPlayerController::AddViewerSteps()
 		return 2.0f;
 	});
 	TourSteps.Add([this]() -> float { Shot(TEXT("airflow_above")); return 0.8f; });
-	// the whole floor from above with the mist on
+	// the whole building from above with the mist on
 	TourSteps.Add([this]() -> float
 	{
+		CurrentFloor = Director.IsValid() ? FMath::Max(0, Director->Floors.Num() - 1) : 0;
+		ApplyFloorVisibility();
 		FBox All(ForceInit);
 		for (const auto& F : RoomFloors)
 		{
@@ -1580,4 +1920,142 @@ void ATwinPlayerController::FinishTour(int32 ExitCode)
 		// only a forced exit carries the code on Windows; the report above is already on disk
 		FPlatformMisc::RequestExitWithStatus(true, (uint8)ExitCode);
 	}
+}
+
+void ATwinPlayerController::AddFloorSteps()
+{
+	// multi-floor buildings: walk up through every floor and back down with PgUp / PgDn, then one cutaway view per
+	// floor (ceilings and the floors above hidden)
+	ATwinViewerDirector* D0 = Director.Get();
+	if (!D0 || !D0->IsMultiFloor())
+	{
+		return;
+	}
+	const int32 N = D0->Floors.Num();
+	TourSteps.Add([this]() -> float
+	{
+		TourFloors = MakeShared<FJsonObject>();
+		TourJumps.Reset();
+		TArray<TSharedPtr<FJsonValue>> List;
+		for (const FTwinFloor& F : Director->Floors)
+		{
+			TSharedPtr<FJsonObject> O = MakeShared<FJsonObject>();
+			O->SetStringField(TEXT("key"), F.Key);
+			O->SetStringField(TEXT("label"), F.Label);
+			O->SetStringField(TEXT("project_name"), F.ProjectName);
+			O->SetNumberField(TEXT("floor_z_cm"), F.FloorZ);
+			int32 Rooms = 0;
+			for (const auto& R : RoomFloors)
+			{
+				Rooms += (R.IsValid() && TwinMeta::Get(R.Get(), TEXT("Floor")) == F.Key) ? 1 : 0;
+			}
+			O->SetNumberField(TEXT("rooms"), Rooms);
+			List.Add(MakeShared<FJsonValueObject>(O));
+		}
+		TourFloors->SetNumberField(TEXT("count"), Director->Floors.Num());
+		TourFloors->SetArrayField(TEXT("floors"), List);
+		Selected.Reset();
+		SetCeilingsVisible(true);
+		if (ATwinCharacter* C = TwinPawn())
+		{
+			C->SetGhost(false);
+			C->SetFlying(false);
+		}
+		TeleportToRoom(StartRoom);
+		CurrentFloor = FMath::Max(0, FloorOfActor(RoomFloors.IsValidIndex(StartRoom) ? RoomFloors[StartRoom].Get() : nullptr));
+		return 1.5f;
+	});
+	auto Jump = [this](int32 Direction)
+	{
+		TourSteps.Add([this, Direction]() -> float
+		{
+			TSharedPtr<FJsonObject> J = MakeShared<FJsonObject>();
+			J->SetNumberField(TEXT("from"), CurrentFloor);
+			J->SetStringField(TEXT("method"), JumpFloor(Direction));
+			J->SetNumberField(TEXT("to"), CurrentFloor);
+			TourJumps.Add(MakeShared<FJsonValueObject>(J));
+			return 1.5f;  // land, settle on the floor
+		});
+		TourSteps.Add([this]() -> float
+		{
+			TSharedPtr<FJsonObject> J = TourJumps.Last()->AsObject();
+			UpdateCurrentRoom();
+			const ATwinViewerDirector* D = Director.Get();
+			const FVector P = GetPawn() ? GetPawn()->GetActorLocation() : FVector::ZeroVector;
+			const float Feet = P.Z - ATwinCharacter::CapsuleHalfHeightCm;
+			const int32 To = (int32)J->GetNumberField(TEXT("to"));
+			const FString Landed = TwinMeta::Get(CurrentRoomFloor.Get(), TEXT("Floor"));
+			J->SetArrayField(TEXT("location_cm"), VecJson(P));
+			J->SetStringField(TEXT("room"), TwinMeta::Get(CurrentRoomFloor.Get(), TEXT("RoomName")));
+			J->SetStringField(TEXT("landed_on_floor"), Landed);
+			J->SetNumberField(TEXT("feet_above_floor_cm"), D && D->Floors.IsValidIndex(To) ? Feet - D->Floors[To].FloorZ : 0.0);
+			J->SetBoolField(TEXT("ok"), D && D->Floors.IsValidIndex(To) && Landed == D->Floors[To].Key &&
+			                FMath::Abs(Feet - D->Floors[To].FloorZ) < 60.f);
+			if (D && D->Floors.IsValidIndex(To))
+			{
+				Shot(FString::Printf(TEXT("floor_%s"), *D->Floors[To].Key));
+			}
+			return 0.6f;
+		});
+	};
+	for (int32 i = 1; i < N; ++i)
+	{
+		Jump(1);
+	}
+	for (int32 i = 1; i < N; ++i)
+	{
+		Jump(-1);
+	}
+	for (int32 i = 0; i < N; ++i)
+	{
+		TourSteps.Add([this, i]() -> float
+		{
+			ATwinViewerDirector* D = Director.Get();
+			if (!D || !D->Floors.IsValidIndex(i))
+			{
+				return 0.1f;
+			}
+			if (ATwinCharacter* C = TwinPawn())
+			{
+				C->SetGhost(true);
+			}
+			CurrentFloor = i;
+			SetCeilingsVisible(false);  // + the floors above: a cutaway of floor i
+			FBox B(ForceInit);
+			for (const auto& R : RoomFloors)
+			{
+				if (R.IsValid() && TwinMeta::Get(R.Get(), TEXT("Floor")) == D->Floors[i].Key)
+				{
+					B += R->GetComponentsBoundingBox(true);
+				}
+			}
+			if (!B.IsValid)
+			{
+				B = D->Floors[i].Bounds;
+			}
+			const FVector Center = B.GetCenter();
+			const float Span = FMath::Max(B.GetSize().X, B.GetSize().Y);
+			PlaceCamera(Center + FVector(-0.45f * Span, 0.75f * Span, 0.95f * Span), Center);
+			return 2.5f;
+		});
+		TourSteps.Add([this, i]() -> float
+		{
+			Shot(FString::Printf(TEXT("floor_overview_%s"), *Director->Floors[i].Key));
+			return 0.8f;
+		});
+	}
+	TourSteps.Add([this]() -> float
+	{
+		bool bAll = TourJumps.Num() > 0;
+		for (const TSharedPtr<FJsonValue>& J : TourJumps)
+		{
+			bAll &= J->AsObject()->GetBoolField(TEXT("ok"));
+		}
+		TourFloors->SetArrayField(TEXT("jumps"), TourJumps);
+		TourFloors->SetBoolField(TEXT("all_jumps_ok"), bAll);
+		TourReport->SetObjectField(TEXT("floors"), TourFloors);
+		CurrentFloor = 0;
+		SetCeilingsVisible(true);
+		return 0.2f;
+	});
 }

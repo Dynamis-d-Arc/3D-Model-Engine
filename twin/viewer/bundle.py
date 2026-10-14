@@ -156,8 +156,11 @@ def expected_bounds_ue(manifest: dict) -> dict[str, tuple[list[float], list[floa
 
 def check_model(manifest: dict, gltf: dict, binary: bytes, tol_cm: float = TOL_CM) -> dict:
     """Every manifest object must be a glTF node whose Unreal-space bounds match the scene model."""
-    expected = expected_bounds_ue(manifest)
-    got = node_bounds_ue(gltf, binary)
+    return compare_bounds(expected_bounds_ue(manifest), node_bounds_ue(gltf, binary), tol_cm)
+
+
+def compare_bounds(expected: dict, got: dict, tol_cm: float = TOL_CM) -> dict:
+    """Expected vs actual node bounds (name -> (min, max) in Unreal cm): the preflight report."""
     failures, worst = [], 0.0
     for name, (emin, emax) in expected.items():
         if name not in got:

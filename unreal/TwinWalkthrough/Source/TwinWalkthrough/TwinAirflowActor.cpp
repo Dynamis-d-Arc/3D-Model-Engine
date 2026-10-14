@@ -152,6 +152,12 @@ void ATwinAirflowActor::SetMistShown(bool bInShown)
 	ApplyVisibility();
 }
 
+void ATwinAirflowActor::SetFloorHidden(bool bInHidden)
+{
+	bFloorHidden = bInHidden;
+	ApplyVisibility();
+}
+
 int32 ATwinAirflowActor::NumMistZones() const
 {
 	return MistMeshes.Num();
@@ -221,10 +227,13 @@ FVector ATwinAirflowActor::Contain(const FZone& Z, FVector P, float Top) const
 	return P;
 }
 
-void ATwinAirflowActor::Build(const TSharedPtr<FJsonObject>& Airflow, ATwinViewerDirector* InDirector)
+void ATwinAirflowActor::Build(const TSharedPtr<FJsonObject>& Airflow, ATwinViewerDirector* InDirector, const FString& InUnitPrefix,
+                              const FString& InFloorKey)
 {
 	Clear();
 	Director = InDirector;
+	UnitPrefix = InUnitPrefix;
+	Floor = InFloorKey;
 	if (!Airflow.IsValid())
 	{
 		return;
@@ -291,7 +300,7 @@ void ATwinAirflowActor::Build(const TSharedPtr<FJsonObject>& Airflow, ATwinViewe
 	{
 		return;
 	}
-	Dots->AddInstances(Xf, false, true, false);
+	Dots->AddInstances(Xf, false, false, false);  // component space: the actor carries the floor offset
 	for (int32 i = 0; i < Xf.Num(); ++i)  // the web's pale tracer colour; the mist carries the temperature
 	{
 		Dots->SetCustomDataValue(i, 0, 0.89f);
@@ -482,7 +491,7 @@ void ATwinAirflowActor::UpdateDrivers()
 		int32 Running = 0;
 		for (const FZone& Z : Zones)
 		{
-			const FTwinHvacReading* R = D->ReadingFor(Z.UnitId);
+			const FTwinHvacReading* R = D->ReadingFor(UnitPrefix + Z.UnitId);
 			const float A = AirTemp(R);
 			if (!FMath::IsNaN(A))
 			{
@@ -505,7 +514,7 @@ void ATwinAirflowActor::UpdateDrivers()
 		const float FloorCoolingW = FMath::Max(0.f, Running * InputKW) * (CoolingKW / InputKW) * 1000.f;
 		for (FZone& Z : Zones)
 		{
-			const FTwinHvacReading* R = D->ReadingFor(Z.UnitId);
+			const FTwinHvacReading* R = D->ReadingFor(UnitPrefix + Z.UnitId);
 			Z.Temp = Z.UnitXY.X < SplitX ? W : E;
 			Z.Drop = DropFor(Z.Temp, FloorCoolingW, FloorLps);
 			Z.bHidden = !(R && R->bOn);
@@ -562,16 +571,16 @@ void ATwinAirflowActor::ApplyVisibility()
 	{
 		if (Z.Mesh)
 		{
-			Z.Mesh->SetVisibility(bShown && bMistShown && bTemps && !Z.bHidden);
+			Z.Mesh->SetVisibility(bShown && !bFloorHidden && bMistShown && bTemps && !Z.bHidden);
 		}
 	}
-	Dots->SetVisibility(bShown);
+	Dots->SetVisibility(bShown && !bFloorHidden);
 }
 
 void ATwinAirflowActor::Tick(float DeltaSeconds)
 {
 	Super::Tick(DeltaSeconds);
-	if (!bShown || Xf.Num() == 0)
+	if (!bShown || bFloorHidden || Xf.Num() == 0)
 	{
 		return;
 	}
@@ -595,5 +604,5 @@ void ATwinAirflowActor::Tick(float DeltaSeconds)
 			Visible += bOff ? 0 : 1;
 		}
 	}
-	Dots->BatchUpdateInstancesTransforms(0, Xf, true, true, true);
+	Dots->BatchUpdateInstancesTransforms(0, Xf, false, true, true);
 }

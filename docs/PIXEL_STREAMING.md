@@ -19,6 +19,8 @@ nothing but a browser. The three.js preview on the Generate tab is unchanged; st
   rotation (`AddYawInput` after `Super::PlayerTick` was always discarded — this also affected the desktop viewer and
   is now covered by the tour's `look` check), and in streaming mode the mouse deltas are read by a Slate input
   pre-processor, because an off-screen viewport has no window to capture the mouse, so the input axes stay near zero.
+  Both paths turn by the same mouse sensitivity setting (**[ / ]**, see UNREAL_VIEWER.md). A streamed delta is in
+  streamer pixels, which the player scales by stream width / shown width, so a small player turns faster.
 * Ending a session from the page stops the viewer process tree and deletes its token file.
 * The signalling server listened on 127.0.0.1 only (player 8090, streamer 8888, SFU 8889).
 * The desktop viewer tests (`tests/test_unreal_viewer.py`) pass against the streaming-enabled package.
