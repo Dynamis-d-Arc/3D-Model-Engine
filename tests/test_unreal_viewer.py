@@ -92,7 +92,13 @@ def test_packaged_viewer_walkthrough(tour):
     assert r["walk"]["arrived"] is True, r["walk"]
     assert r["wall_collision"]["stayed_inside_room"] is True, r["wall_collision"]
     assert r["look"]["ok"] is True, r["look"]   # mouse / arrow-key look turns the view and the turn sticks
+    # raw mouse counts through the input stack turn the view at the sensitivity setting (default 0.07 deg/count)
+    assert r["mouse_look"]["ok"] is True, r["mouse_look"]
+    assert r["mouse_look"]["deg_per_count"] == pytest.approx(0.07), r["mouse_look"]
     assert r["selection"]["selected"] is True and r["selection"]["kind"] == "furniture"
+    # HUD: the full controls card (H) once, the one-line hint bar in every other shot; the HVAC unit again with the
+    # technical details (I)
+    assert {"help.png", "hvac_selection.png", "hvac_details.png"} <= set(r["screenshots"]), r["screenshots"]
     for shot in r["screenshots"]:
         assert (out / shot).stat().st_size > 10_000, shot
 
@@ -129,6 +135,40 @@ def test_packaged_viewer_switches_buildings(served, tour):
     assert s["ready"] is True and s["build_id"] == served["plain"], s
     assert s["validation"]["ok"] and s["actors"] == len(m["objects"]) + len(m["furniture"])
     assert s["twin_actors_in_world"] == s["actors"] + 1  # nothing of the previous building is left
+
+
+def test_packaged_viewer_multi_floor_building(served, tour):
+    """The plain and the HVAC build stacked as two floors: one merged model, PgUp / PgDn jumps, per-floor airflow."""
+    be, pid = served["backend"], served["pid"]
+    with be.client() as c:
+        st = c.post("/api/stacks", json={"name": "Two-storey apartment", "floors": [
+            {"project_id": pid, "build_id": served["plain"]}, {"project_id": pid, "build_id": served["hvac"]}]}).json()
+        launch = c.post(f"/api/stacks/{st['id']}/viewer/launch", json={}).json()["launch"]
+    z2 = st["plan"]["floors"][1]["elevation_m"] * 100
+    out = served["root"] / "tour_stack"
+    code, r = run_viewer(launch, out)
+    assert code == 0 and r is not None, r
+    m1, m2 = served["manifests"][served["v1"]], served["manifests"][served["v2"]]
+    v = r["viewer"]["validation"]
+    assert v["ok"] and v["checked"] == sum(len(m["objects"]) + len(m["furniture"]) for m in (m1, m2)), v
+    assert v["rooms_with_floor"] == len(m1["rooms"]) + len(m2["rooms"])
+    f = r["floors"]
+    assert f["count"] == 2 and [x["key"] for x in f["floors"]] == ["F1", "F2"]
+    assert f["floors"][1]["floor_z_cm"] == pytest.approx(z2, abs=0.5)
+    # up to Level 2 and back down: each landing on the right floor, feet on its floor finish
+    assert f["all_jumps_ok"] is True, f["jumps"]
+    assert [(j["from"], j["to"]) for j in f["jumps"]] == [(0, 1), (1, 0)]
+    assert f["jumps"][0]["landed_on_floor"] == "F2" and f["jumps"][1]["landed_on_floor"] == "F1"
+    nav = r["navigation"]
+    assert nav["rooms_on_other_floors"] == len(m2["rooms"]) and all(x["reachable"] for x in nav["reachability"][1:]), nav
+    # only Level 2 has HVAC: its units, readings and airflow come with the F2_ prefix and its offset
+    h = r["hvac"]
+    assert h["unit_actors"] == h["unit_actors_matched"] == 2 and h["build_units"] == 2, h
+    assert h["selected_tag"] in ("FCU-1", "SPLIT-1")
+    a = r["airflow"]
+    assert a["units"] == 2 and a["mist"]["zones"] == 2 and a["mist"]["params_ok"] is True, a
+    for shot in ("floor_F2", "floor_F1", "floor_overview_F1", "floor_overview_F2", "airflow_overview"):
+        assert (out / f"{shot}.png").stat().st_size > 10_000, shot
 
 
 def test_packaged_viewer_reuses_its_cache(served, tour):

@@ -34,7 +34,9 @@ from twin.imaging.pdf_text import calibration_for, extract_pdf_text
 from twin.imaging.preprocess import UploadRejected, normalize_upload
 from twin.layers import run_layer_build
 from twin.pipeline import run_build
+from twin.scene import autofix as rules
 from twin.scene import derive
+from twin.scene import problems as problem_info
 from twin.scene.compile import scene_hash
 from twin.scene.diff import change_summary, diff_scenes
 from twin.scene.sensors import (KIND_COLORS, KIND_LABELS, KIND_UNITS, SHEET_TEMPLATE, TAG_PREFIX, geometry_key,
@@ -125,6 +127,26 @@ class SensorSheetBody(BaseModel):
 class RedesignBody(BaseModel):
     prompt: str = Field(min_length=3, max_length=2000)
     reference_file_ids: list[str] = Field(default_factory=list, max_length=4)
+
+
+class AutofixBody(BaseModel):
+    scene: dict
+    brief: Brief | None = None
+    codes: list[str] | None = Field(default=None, max_length=60, description="only these issue codes")
+    targets: list[str] | None = Field(default=None, max_length=200, description="only problems touching these, e.g. 'furniture:F3'")
+
+
+class MissingWallsBody(BaseModel):
+    scene: dict
+    room_id: str
+
+
+class SolveBody(BaseModel):
+    """'Fix problems': the free rules first, then (use_ai) the AI problem solver for what is left."""
+    use_ai: bool = True
+    include_plan: bool = True
+    codes: list[str] | None = Field(default=None, max_length=60)
+    targets: list[str] | None = Field(default=None, max_length=200)
 
 
 class FixBody(BaseModel):
@@ -228,7 +250,8 @@ def create_app(settings: Settings | None = None, ai_transport=None) -> FastAPI:
         return {"version": __version__, "ai": settings.ai.public(), "blender": blender, "unreal": unreal,
                 "ai_usage_today": storage.ai_usage_today(), "ai_daily_limit": settings.ai.daily_request_limit,
                 "ai_budget": budget().status(),
-                "streaming": app.state.streamer.status() if getattr(app.state, "streamer", None) else None}
+                "streaming": app.state.streamer.status() if getattr(app.state, "streamer", None) else None,
+                "desktop_viewer": app.state.desktop_viewer.status() if getattr(app.state, "desktop_viewer", None) else None}
 
     @app.get("/api/catalog")
     def catalog() -> dict:
@@ -242,6 +265,8 @@ def create_app(settings: Settings | None = None, ai_transport=None) -> FastAPI:
             "room_types": list(Room.model_fields["type"].annotation.__args__),
             "sensor_kinds": [{"id": k, "label": v, "unit": KIND_UNITS[k], "color": KIND_COLORS[k], "prefix": TAG_PREFIX[k]}
                              for k, v in KIND_LABELS.items()],
+            "problems": problem_info.catalog(),          # plain-language titles + how each issue code is fixed
+            "rule_codes": sorted(rules.RULES),
         }
 
     @app.get("/api/schema/scene")
@@ -404,6 +429,24 @@ def create_app(settings: Settings | None = None, ai_transport=None) -> FastAPI:
             raise ApiError(422, "CANNOT_FIT", str(exc))
         return {"scene": scene.model_dump(mode="json")}
 
+    @app.post("/api/scene/autofix")
+    def autofix_tool(body: AutofixBody) -> dict:
+        """Free rule-based fixes (twin.scene.autofix) applied to an unsaved scene; the editor shows the result as an
+        undoable edit."""
+        scene, actions, report = rules.autofix(parse_scene(body.scene), body.brief,
+                                               codes=set(body.codes) if body.codes else None,
+                                               targets=set(body.targets) if body.targets else None)
+        return {"scene": scene.model_dump(mode="json"), "actions": [a.as_dict() for a in actions],
+                "report": report.model_dump(mode="json")}
+
+    @app.post("/api/scene/add-missing-walls")
+    def add_missing_walls(body: MissingWallsBody) -> dict:
+        scene = parse_scene(body.scene)
+        if body.room_id not in {r.id for r in scene.rooms}:
+            raise ApiError(404, "NOT_FOUND", f"room {body.room_id} is not in the scene")
+        scene, notes = rules.add_missing_walls(scene, body.room_id)
+        return {"scene": scene.model_dump(mode="json"), "notes": notes}
+
     @app.post("/api/scene/accept-estimates")
     def accept_estimates(body: SceneBody) -> dict:
         """Mark every remaining estimated/extracted value as a knowingly accepted estimate."""
@@ -559,6 +602,90 @@ def create_app(settings: Settings | None = None, ai_transport=None) -> FastAPI:
                                     "can_generate": v["validation"]["can_generate"]}
 
         return jobs.submit(pid, "fix", body.model_dump(), run, version=number)
+
+    def plan_image(pid: str) -> Path | None:
+        plans = [f for f in storage.list_files(pid) if f["kind"] == "plan"]
+        return storage.upload_dir(pid, plans[-1]["id"]) / "normalized.png" if plans else None
+
+    @app.get("/api/projects/{pid}/versions/{number}/solve/estimate")
+    def solve_estimate(pid: str, number: int) -> dict:
+        """What 'Fix problems' would do with this version: how many problems the free rules take, how many go to the
+        AI problem solver, and its expected / worst-case cost."""
+        from twin.ai.fix import compact_scene
+        from twin.ai.solve import MAX_OUTPUT_TOKENS
+        meta = storage.get_version_meta(pid, number)
+        issues = [i for i in (meta.get("validation") or {}).get("issues", []) if i["severity"] in ("error", "warning")]
+        rule = sum(1 for i in issues if i["code"] in rules.RULES)
+        ai_only = sum(1 for i in issues if i["code"] in problem_info.AI_CODES and i["code"] not in rules.RULES)
+        solver = settings.ai.solver()
+        est = worst = None
+        if solver.price_input_per_1m is not None and solver.price_output_per_1m is not None:
+            chars = len(json.dumps(compact_scene(storage.load_scene(pid, number)), separators=(",", ":")))
+            tokens_in = chars / 3.5 + 3000                 # + the plan image and the instructions
+            est = round((tokens_in * solver.price_input_per_1m + 6000 * solver.price_output_per_1m) / 1e6, 2)
+            worst = round(2 * (tokens_in * 1.3 * solver.price_input_per_1m + MAX_OUTPUT_TOKENS * solver.price_output_per_1m) / 1e6, 2)
+        return {"rule_fixable": rule, "ai_problems": ai_only, "model": solver.model, "ai_configured": settings.ai.configured,
+                "est_usd": est, "max_usd": worst, "remaining_usd": budget().status().get("remaining_usd")}
+
+    @app.post("/api/projects/{pid}/versions/{number}/solve", status_code=202)
+    def solve(pid: str, number: int, body: SolveBody) -> dict:
+        """'Fix problems': free rules, then the AI problem solver for what is left -> one new version to review."""
+        from twin.ai.solve import ai_problems, solve_problems
+        scene = storage.load_scene(pid, number)
+        brief = storage.brief(pid)
+        before = (storage.get_version_meta(pid, number).get("validation") or {}).get("counts", {})
+        img = plan_image(pid) if body.include_plan else None
+        codes = set(body.codes) if body.codes else None
+        targets = set(body.targets) if body.targets else None
+
+        def run(ctx: JobContext) -> tuple[str, dict]:
+            ctx.progress(0.05, "fixing the simple problems (free rules)")
+            fixed, actions, report = rules.autofix(scene, brief, codes=codes, targets=targets)
+            ai_info: dict | None = None
+            todo = ai_problems(report, codes, targets) if body.use_ai else []
+            if todo:
+                solver = settings.ai.solver()
+                if not settings.ai.configured:
+                    ai_info = {"model": solver.model, "asked": len(todo), "error": {
+                        "code": "AI_NOT_CONFIGURED", "message": "AI is not configured, so only the free fixes were made."}}
+                elif storage.ai_usage_today()["calls"] >= settings.ai.daily_request_limit:
+                    ai_info = {"model": solver.model, "asked": len(todo), "error": {
+                        "code": "AI_LIMIT_REACHED", "message": "The daily AI request limit is reached; only the free fixes were made."}}
+                else:
+                    ctx.progress(0.3, f"asking {solver.model} to solve {len(todo)} problem(s)")
+                    client = AIClient(solver, transport=ai_transport, budget=BudgetGuard(
+                        storage, solver, project_id=pid, job_id=ctx.job_id, purpose="solve"))
+                    raw_dir = storage.project_dir(pid) / "ai_responses"
+
+                    def keep(raw: dict) -> None:
+                        raw_dir.mkdir(parents=True, exist_ok=True)
+                        (raw_dir / f"{ctx.job_id}_solve{raw['attempt']}.json").write_text(json.dumps(raw), encoding="utf-8")
+                    try:
+                        out = solve_problems(client, fixed, todo, brief, img, raw_sink=keep)
+                    except AIError as exc:
+                        ai_info = {"model": solver.model, "asked": len(todo), "error": {"code": exc.code, "message": str(exc)},
+                                   "cost_usd": round(client.last_cost_usd or 0.0, 6)}
+                    else:
+                        fixed = out.scene
+                        ai_info = {"model": solver.model, "asked": len(todo), "summary": out.summary, "changes": out.changes,
+                                   "questions": out.questions, "solved": out.solved, "introduced": out.introduced,
+                                   "rejected": out.rejected, "usage": [r.usage for r in out.results],
+                                   "cost_usd": round(client.last_cost_usd or 0.0, 6)}
+            result = {"rule_fixes": [a.as_dict() for a in actions], "ai": ai_info, "before": before}
+            if not actions and not (ai_info and ai_info.get("changes")):
+                final = validate_scene(scene, brief)
+                return "completed", {**result, "version": None, "after": final.counts,
+                                     "remaining": [i.model_dump() for i in final.issues if i.severity != "info"][:80]}
+            ctx.progress(0.92, "saving the fixed version")
+            parts = [f"{len(actions)} fixed by rules"] if actions else []
+            if ai_info and ai_info.get("changes"):
+                parts.append(f"{len(ai_info['changes'])} AI edit(s) by {ai_info['model']}")
+            v = store_version(pid, fixed, "auto_fix", "Fixed problems: " + ", ".join(parts), number)
+            val = v["validation"]
+            return "needs_review", {**result, "version": v["number"], "after": val["counts"], "can_generate": val["can_generate"],
+                                    "remaining": [i for i in val["issues"] if i["severity"] != "info"][:80]}
+
+        return jobs.submit(pid, "solve", body.model_dump(), run, version=number)
 
     @app.get("/api/projects/{pid}/versions/{number}/detect-furniture/estimate")
     def detect_furniture_estimate(pid: str, number: int) -> dict:

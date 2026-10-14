@@ -5,6 +5,7 @@ import { refreshProject, switchTab } from "./app.js";
 import { planFileId } from "./brief.js";
 import { state, on, emit, assetById, ROOM_COLORS } from "./state.js";
 import { h, mount, toast, showError, badge, ask, confirmDialog, fmtM } from "./ui.js";
+import { problemsCard } from "./problems.js";
 
 const SVGNS = "http://www.w3.org/2000/svg";
 const SNAP = 0.05;
@@ -25,7 +26,9 @@ let sensorsVisible = true;
 let savedSensors = "[]", savedBuilding = "";
 let layerOffer = null;   // {version, options}: after a save that changed only sensors, offer the in-place update
 let layerJob = null;
-let hvacJob = null, fixJob = null, furnJob = null;
+let hvacJob = null, fixJob = null, furnJob = null, solveJob = null;
+let solveEstimate = null;   // {key, data}: what "Fix problems" would do with the loaded version
+const folds = new Map();   // side cards the user opened / closed
 let furnEstimate = null;   // {key, data}: cost estimate of the furniture detection for the loaded version
 let mode = "select";
 let calib = null; // {step, a, b, mPerPx}
@@ -285,7 +288,8 @@ async function serverTool(path, body, message) {
   try {
     const res = await post(path, { scene, ...body });
     edit(() => { scene = res.scene; });
-    if (message) toast(message(res), "ok");
+    const text = message && message(res);
+    if (text) toast(text, "ok");
     return res;
   } catch (e) { showError(e, path.split("/").pop()); }
 }
@@ -1206,7 +1210,7 @@ function fixCard() {
       "Diffuser SD12 belongs to FCU-4 · Add a door between the kitchen and the corridor" });
   const selText = sel ? `${sel.type}:${sel.id}` : null;
   const running = fixJob && !["completed", "needs_review", "failed"].includes(fixJob.status);
-  return h("div.card", null, h("h2", null, "Fix with AI"),
+  return h("div.card", null, h("h2", null, "Ask AI to change something"),
     h("p.small.muted", { style: { margin: "0 0 6px" } }, "Describe what is wrong with the model in plain words. The AI proposes edits and you get a new version to review; nothing is overwritten."),
     ta,
     h("div.row", { style: { marginTop: "6px" } },
@@ -1252,40 +1256,65 @@ async function fixDialog(target) {
 }
 
 
-function issuesCard() {
-  if (reportError) {
-    return h("div.card", null, h("h2", null, "Validation"),
-      h("div.notice.error", null, h("b", null, reportError.code), ": ", reportError.message,
-        Array.isArray(reportError.detail) ? h("ul", null, reportError.detail.map((d) => h("li", null, d))) : null));
-  }
-  if (!report) return null;
-  const order = { error: 0, review: 1, warning: 2, info: 3 };
-  const issues = [...report.issues].sort((a, b) => order[a.severity] - order[b.severity]);
-  const target = (t) => {
-    const [type, id] = t.split(":");
-    if (["room", "wall", "opening", "furniture", "hvac_unit", "hvac_terminal", "duct", "sensor"].includes(type)) select({ type, id });
-  };
-  return h("div.card", null,
-    h("div.row", null, h("h2", { style: { margin: 0 } }, "Validation"), h("span.spacer"),
-      report.can_generate ? badge("ready to generate", "ok") : badge(report.ok ? "needs review" : "has errors", report.ok ? "review" : "error")),
-    h("div.small.muted", { style: { margin: "6px 0" } }, ["error", "review", "warning", "info"].map((k) => `${report.counts[k] || 0} ${k}`).join(" · ")),
-    issues.length ? h("div", null, issues.map((i) => h("div.issue", { onclick: () => i.targets[0] && target(i.targets[0]) },
-      badge(i.severity), h("span", null, i.message)))) : h("div.notice.ok", null, "No issues found."),
-    report.counts.review ? h("div.row", { style: { marginTop: "8px" } },
-      h("button.btn.small", { onclick: () => serverTool("/api/scene/accept-estimates", {}, (r) => `${r.changed} values marked as accepted estimates`) },
-        "Accept all remaining estimates")) : null);
+/** Save unsaved edits as a new version without asking (jobs start from a saved version). */
+async function ensureSaved(note = "edited in review") {
+  if (!dirty) return true;
+  try {
+    const res = await post(`/api/projects/${state.project.id}/versions`, { scene, parent: loadedVersion, note, source: "edit" });
+    dirty = false;
+    await refreshProject();
+    await loadVersion(res.number, true);
+    toast(`Your edits were saved as v${res.number} first.`, "info");
+    return true;
+  } catch (e) { showError(e, "Saving failed"); return false; }
 }
 
-function questionsCard() {
-  const open = scene.open_questions.filter((q) => !q.resolved);
-  if (!scene.open_questions.length) return null;
-  return h("div.card", null, h("h2", null, `Questions from the AI (${open.length} open)`),
-    scene.open_questions.map((q) => h("div", { style: { padding: "6px 0", borderBottom: "1px solid #eee" } },
-      h("div.row", null, badge(q.severity), q.resolved ? badge("resolved", "ok") : null, h("span.small.muted", null, q.target)),
-      h("div", { style: { margin: "4px 0" } }, q.question),
-      q.resolved ? h("div.small.muted", null, `Answer: ${q.answer || "(resolved)"}`) :
-        h("div.row", null, h("input", { placeholder: "Your answer / what you changed", id: `qa-${q.id}`, style: { flex: 1 } }),
-          h("button.btn.small", { onclick: () => edit(() => { q.answer = /** @type {HTMLInputElement} */ (document.getElementById(`qa-${q.id}`)).value; q.resolved = true; }) }, "Resolve")))));
+/** "Fix problems": free rules, then the AI problem solver for the rest -> one new version, opened when ready. */
+async function runSolve(opts = {}) {
+  if (!(await ensureSaved())) return;
+  try {
+    solveJob = await post(`/api/projects/${state.project.id}/versions/${loadedVersion}/solve`, opts);
+    drawSide();
+    const { watchJob } = await import("./app.js");
+    const final = await watchJob(solveJob.id, (j) => { solveJob = j; drawSide(); });
+    solveJob = final;
+    await refreshProject();
+    if (final.status === "needs_review" && final.result.version) {
+      await loadVersion(final.result.version, true);
+      const r = final.result;
+      const done = [r.rule_fixes.length ? `${r.rule_fixes.length} fixed for free` : null,
+        r.ai?.changes?.length ? `${r.ai.solved?.length || 0} solved by the AI` : null].filter(Boolean);
+      toast(`v${r.version} saved: ${done.join(", ")}. Look it over; the old version is kept.`, "ok", 9000);
+    } else if (final.status === "failed") showError(final.error || { message: "failed" }, "Fix problems");
+    else drawSide();
+  } catch (e) { showError(e, "Fix problems"); }
+}
+
+function problemsCtx() {
+  const key = `${state.project.id}:${loadedVersion}`;
+  if (!dirty && (!solveEstimate || solveEstimate.key !== key)) {
+    solveEstimate = { key, data: null };
+    get(`/api/projects/${state.project.id}/versions/${loadedVersion}/solve/estimate`)
+      .then((d) => { if (solveEstimate.key === key) { solveEstimate.data = d; drawSide(); } }).catch(() => {});
+  }
+  const target = (t) => {
+    const [type, id] = String(t).split(":");
+    if (["room", "wall", "opening", "furniture", "hvac_unit", "hvac_terminal", "duct", "sensor"].includes(type)) select({ type, id });
+  };
+  return { report, reportError, scene, dirty, version: loadedVersion, select: target, tool: serverTool, edit,
+    solve: runSolve, solveJob, estimate: solveEstimate?.key === key ? solveEstimate.data : null, redraw: drawSide };
+}
+
+/** A side card that folds to its title; remembers whether the user opened it. */
+function fold(card, key, open = false) {
+  if (!card) return null;
+  const title = card.querySelector("h2");
+  const det = h("details.card.fold", { open: folds.has(key) ? folds.get(key) : open,
+    ontoggle: (e) => folds.set(key, /** @type {HTMLDetailsElement} */ (e.target).open) },
+    h("summary", null, title ? title.textContent : key));
+  title?.remove();
+  det.append(...card.childNodes);
+  return det;
 }
 
 /** "+2 sensors · 1 wall" from a version's stored change summary (vs its parent). */
@@ -1328,31 +1357,40 @@ async function restoreVersion() {
 
 function drawSide() {
   if (!sideEl || !scene) return;
-  mount(sideEl, inspector(), sensorsCard(), fixCard(), furnitureCard(), hvacCard(), issuesCard(), questionsCard(), versionsCard());
+  mount(sideEl, problemsCard(problemsCtx()), inspector(), fold(fixCard(), "fix", !!fixJob),
+    fold(furnitureCard(), "furniture"), fold(sensorsCard(), "sensors", (scene.sensors || []).length > 0),
+    fold(hvacCard(), "hvac", hvacCount() > 0), fold(versionsCard(), "versions"));
   drawToolbar();
 }
 
 function drawToolbar() {
   const ul = underlayPlacement();
+  const menuItem = (label, fn, title, disabled = false) => h("button.menu-item", { title, disabled, onclick: (e) => {
+    /** @type {HTMLElement} */ (e.target).closest("details")?.removeAttribute("open"); fn(); } }, label);
   mount(toolbarEl,
     h("b", null, `v${loadedVersion}${dirty ? " · unsaved" : ""}`),
-    h("button.btn.small", { onclick: doUndo, disabled: !undo.length, title: "Ctrl+Z" }, "Undo"),
-    h("button.btn.small", { onclick: doRedo, disabled: !redo.length, title: "Ctrl+Y" }, "Redo"),
-    h("button.btn.small" + (mode === "draw-room" ? ".primary" : ""), { onclick: () => { mode = "draw-room"; sel = null; drawAll(); },
+    h("button.btn.small", { onclick: doUndo, disabled: !undo.length, title: "Undo (Ctrl+Z)" }, "↶ Undo"),
+    h("button.btn.small", { onclick: doRedo, disabled: !redo.length, title: "Redo (Ctrl+Y)" }, "↷ Redo"),
+    h("span.tb-sep"),
+    h("button.btn.small" + (mode === "draw-room" ? ".primary" : ""), { onclick: () => { mode = mode === "draw-room" ? "select" : "draw-room"; sel = null; drawAll(); },
       title: "Drag a rectangle on the plan (wall centrelines); snaps to 5 cm, hold Alt for 1 mm" }, "Draw room"),
-    h("button.btn.small", { onclick: addRoomDialog, title: "Add a rectangular room by typing its coordinates" }, "+ Room…"),
-    h("button.btn.small", { onclick: addFurnitureDialog }, "+ Furniture"),
+    h("button.btn.small", { onclick: addFurnitureDialog, title: "Add a furniture item to the selected room" }, "+ Furniture"),
     h("button.btn.small" + (mode === "place-sensor" ? ".primary" : ""), { onclick: () => { mode = mode === "place-sensor" ? "select" : "place-sensor"; sel = null; drawAll(); },
       title: "Click on the plan to place sensors (Esc stops)" }, "+ Sensor"),
-    h("button.btn.small", { onclick: () => serverTool("/api/scene/derive-walls", {}, (r) => `Walls rebuilt from rooms (${r.scene.walls.length} walls)${r.notes.length ? "; " + r.notes.join("; ") : ""}`), title: "Rebuild wall centrelines from room boundaries" }, "Derive walls"),
-    h("button.btn.small", { onclick: fitToBrief, title: "Scale the layout to the brief's outer dimensions" }, "Fit to brief size"),
-    h("button.btn.small", { onclick: startCalibration, disabled: !ul }, ul?.calibrated ? "Re-calibrate plan" : "Calibrate plan"),
-    ul ? h("label.small", null, h("input", { type: "checkbox", checked: underlay.visible, onchange: (e) => { underlay.visible = e.target.checked; draw(); } }), " plan") : null,
-    ul ? h("input", { type: "range", min: "0.1", max: "1", step: "0.05", value: underlay.opacity, style: { width: "80px" }, oninput: (e) => { underlay.opacity = Number(e.target.value); draw(); } }) : null,
-    h("button.btn.small", { onclick: () => { fitView(); draw(); } }, "Zoom to fit"),
+    h("details.menu", null, h("summary.btn.small", { title: "Less common layout tools" }, "More tools ▾"),
+      h("div.menu-pop", null,
+        menuItem("Add a room by coordinates…", addRoomDialog, "Add a rectangular room by typing its coordinates"),
+        menuItem("Rebuild walls from rooms", () => serverTool("/api/scene/derive-walls", {}, (r) => `Walls rebuilt from rooms (${r.scene.walls.length} walls)${r.notes.length ? "; " + r.notes.join("; ") : ""}`),
+          "Replace the walls with new ones along the room outlines"),
+        menuItem("Scale to the size in the brief", fitToBrief, "Scale the layout to the brief's outer dimensions"),
+        menuItem(ul?.calibrated ? "Re-calibrate the plan image" : "Calibrate the plan image", startCalibration, "Click two points a known distance apart", !ul))),
+    h("span.tb-sep"),
+    ul ? h("label.small", { title: "Show the uploaded plan under the layout" }, h("input", { type: "checkbox", checked: underlay.visible, onchange: (e) => { underlay.visible = e.target.checked; draw(); } }), " plan") : null,
+    ul ? h("input", { type: "range", min: "0.1", max: "1", step: "0.05", value: underlay.opacity, title: "Plan image opacity", style: { width: "70px" }, oninput: (e) => { underlay.opacity = Number(e.target.value); draw(); } }) : null,
+    h("button.btn.small", { onclick: () => { fitView(); draw(); }, title: "Show the whole layout" }, "Zoom to fit"),
     h("span.spacer"),
     report?.can_generate && !dirty ? h("button.btn.small", { onclick: () => switchTab("generate") }, "Go to generate →") : null,
-    h("button.btn.primary", { onclick: save, disabled: !dirty }, "Save version"));
+    h("button.btn.primary", { onclick: save, disabled: !dirty, title: dirty ? "Save your edits as a new version" : "No unsaved edits" }, "Save version"));
 }
 
 async function addRoomDialog() {

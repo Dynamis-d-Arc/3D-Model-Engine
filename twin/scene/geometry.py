@@ -152,9 +152,12 @@ def furniture_footprint(item: FurnitureItem, asset: Asset) -> Polygon:
     return footprint_rect(item.position[0], item.position[1], w, d, item.rotation_deg)
 
 
-def room_net_polygon(room: Room, footprints: dict[str, BaseGeometry]) -> BaseGeometry:
-    """Usable floor area: room centreline polygon minus wall footprints."""
-    walls_union = unary_union(list(footprints.values())) if footprints else Polygon()
+def room_net_polygon(room: Room, footprints: dict[str, BaseGeometry],
+                     walls_union: BaseGeometry | None = None) -> BaseGeometry:
+    """Usable floor area: room centreline polygon minus wall footprints. Pass ``walls_union`` (the union of the
+    footprints) when doing this for many rooms: the union is the expensive part."""
+    if walls_union is None:
+        walls_union = unary_union(list(footprints.values())) if footprints else Polygon()
     return shapely.set_precision(room_polygon(room).difference(walls_union), PRECISION_GRID)
 
 

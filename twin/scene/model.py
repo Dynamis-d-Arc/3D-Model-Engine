@@ -139,6 +139,7 @@ class Room(_Strict):
     floor_offset: float = Field(default=0.0, ge=-1.0, le=1.0)
     ceiling_height: float | None = Field(default=None, ge=1.8, le=12.0)
     finishes: RoomFinishes = Field(default_factory=RoomFinishes)
+    open_plan: bool = Field(default=False, description="edges without a wall are intentional (no missing-wall warning)")
     certainty: Certainty = Field(default_factory=Certainty)
 
 

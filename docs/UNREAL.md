@@ -91,9 +91,14 @@ mesh with location/yaw/scale.
 | Right click | walk there along the nav mesh |
 | Tab, 1–9 | jump to the next / n-th room |
 | C | ceilings on/off |
-| X, H, P, Esc | clear selection, help, screenshot (`Saved/Screenshots`), quit |
+| [ / ] (or - / =) | mouse sensitivity slower / faster (kept for the next start) |
+| X, P, Esc | clear selection, screenshot (`Saved/Screenshots`), quit |
+| H | the full controls card (opens by itself for 10 s after a building loads) |
+| I | technical details (model check, data source, ids) |
 
-The HUD shows the project, current room (name, clear size, area, floor material) and the mode.
+The HUD shows the project, the current room (name, clear size, area, flooring) and the mode in plain words, a
+one-line hint bar of the main keys at the bottom, and a warning line only when something is wrong (objects not
+where the plan says, HVAC data unreachable or stale).
 
 ## Scripted tour (automated check)
 

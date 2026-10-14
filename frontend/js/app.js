@@ -99,6 +99,64 @@ async function newProject() {
   }
 }
 
+/**
+ * Where the project stands and the one thing to do next (a slim bar under the tabs, plus ticks on finished steps).
+ * Steps: 1 plan uploaded + layout created, 2 layout ready to build, 3 3D model built for the newest version.
+ */
+function projectProgress(p) {
+  const plan = p.files.some((f) => f.kind === "plan");
+  const v = p.versions[0];
+  const built = v && p.builds.find((b) => b.version === v.number && b.status === "completed");
+  // a job left "processing" by a server restart must not hold the bar forever
+  const running = p.jobs?.find((j) => ["queued", "processing"].includes(j.status) && Date.now() / 1000 - j.created_at < 3600);
+  const counts = v?.counts || {};
+  const blocking = (counts.error || 0) + (counts.review || 0);
+  const done = { brief: !!v, review: !!v?.can_generate, generate: !!built };
+  let msg, action = null, tab = null, cls = "";
+  if (running) {
+    msg = `Working: ${JOB_LABELS[running.kind] || running.kind}${running.stage ? ` (${running.stage})` : ""}…`;
+  } else if (!v && !plan) {
+    msg = "Start by adding your floor plan (PNG, JPG or PDF) and the sizes you know.";
+    action = "Add the floor plan"; tab = "brief";
+  } else if (!v) {
+    msg = "Your plan is uploaded. Let the AI read it and create the layout.";
+    action = "Create the layout"; tab = "brief";
+  } else if (!v.can_generate) {
+    msg = `Layout v${v.number} has ${blocking} thing${blocking === 1 ? "" : "s"} to sort out before the 3D model can be built. ` +
+      "Most can be fixed with one click.";
+    action = "Fix the layout"; tab = "review";
+  } else if (!built) {
+    msg = `Layout v${v.number} is ready${counts.warning ? ` (${counts.warning} minor thing${counts.warning === 1 ? "" : "s"} worth a look)` : ""}. Build the 3D model next.`;
+    action = "Build the 3D model"; tab = "generate";
+  } else {
+    msg = `The 3D model of v${v.number} is ready. Walk through it, or see the live HVAC view.`;
+    action = "View in 3D"; tab = "generate"; cls = "done";
+  }
+  return { msg, action, tab, done, cls };
+}
+
+export const JOB_LABELS = { interpret: "the AI is reading the plan", fix: "the AI is changing the layout", solve: "fixing problems",
+  furniture: "detecting furniture", build: "building the 3D model", layer_build: "updating the 3D model",
+  unreal_import: "preparing the Unreal scene", hvac_import: "reading the HVAC drawing", redesign: "redesigning a room" };
+
+function renderNextStep() {
+  const el = $("nextStep");
+  const p = state.project;
+  document.querySelectorAll(".tab .tick").forEach((t) => t.remove());
+  if (!p) { el.classList.add("hidden"); return; }
+  const st = projectProgress(p);
+  for (const [tab, ok] of Object.entries(st.done)) {
+    if (ok) document.querySelector(`.tab[data-tab=${tab}]`)?.append(h("span.tick", { title: "done" }, "✓"));
+  }
+  const steps = [["brief", "1 Plan"], ["review", "2 Layout"], ["generate", "3 3D model"]];
+  const now = steps.find(([t]) => !st.done[t])?.[0];
+  el.className = "next-step" + (st.cls ? " " + st.cls : "");
+  mount(el,
+    h("div.steps", null, steps.map(([t, label]) => h("span" + (st.done[t] ? ".done" : t === now ? ".now" : ""), null, (st.done[t] ? "✓ " : "") + label))),
+    h("div.msg", null, st.msg),
+    st.action && state.activeTab !== st.tab ? h("button.btn.primary.small", { onclick: () => switchTab(st.tab) }, st.action + " →") : null);
+}
+
 function updateVisibility() {
   const has = !!state.project;
   $("emptyState").classList.toggle("hidden", has);
@@ -119,7 +177,8 @@ async function init() {
   }
   renderStatus();
   renderProjectSelect();
-  on("project", () => { renderProjectSelect(); updateVisibility(); });
+  on("project", () => { renderProjectSelect(); updateVisibility(); renderNextStep(); });
+  on("tab", () => renderNextStep());
   on("project", () => get("/api/projects").then((p) => { state.projects = p; renderProjectSelect(); }).catch(() => {}));
   renderBrief($("tab-brief"));
   renderReview($("tab-review"));

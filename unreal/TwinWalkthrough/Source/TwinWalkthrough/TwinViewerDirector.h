@@ -58,6 +58,33 @@ struct FTwinTelemetry
 	float OutdoorC = NAN;
 };
 
+/**
+ * One floor of the loaded building. A multi-floor building (manifest "floors", twin.viewer.stacks) has one per
+ * storey, bottom first, keys F1, F2, ...; a single build is one floor with an empty key.
+ */
+struct FTwinFloor
+{
+	FString Key;
+	FString Label;            // e.g. "Level 2"
+	FString ProjectName;
+	float FloorZ = 0.f;       // floor finish, Unreal cm
+	FVector Offset = FVector::ZeroVector;
+	FBox Bounds = FBox(ForceInit);
+	FVector PlayerStart = FVector::ZeroVector;
+	float PlayerYaw = 0.f;
+	FString PlayerRoom;
+};
+
+/** Where a visitor lands on another floor (see ATwinViewerDirector::FloorSpot). */
+struct FTwinFloorSpot
+{
+	FVector Same = FVector::ZeroVector;   // the same plan position, on the floor of the room found there
+	bool bSameValid = false;
+	FVector Fallback = FVector::ZeroVector; // that room's spawn point, else a stair / lift, else the floor's start
+	FString RoomName;
+	FString Method;                         // "same spot" | "stair or lift" | "floor entrance"
+};
+
 struct FTwinBuildingEntry
 {
 	FString ProjectId;
@@ -112,6 +139,16 @@ public:
 	void RefreshBuildings();
 	void SetAirflowVisible(bool bVisible);
 	bool IsAirflowVisible() const;
+	/** The airflow illustration of one floor (multi-floor buildings get one actor per floor), else the first. */
+	ATwinAirflowActor* AirflowForFloor(int32 FloorIndex) const;
+
+	// ---- floors ----------------------------------------------------------------------------------
+	bool IsMultiFloor() const { return Floors.Num() > 1; }
+	int32 FloorIndexOf(const FString& Key) const;
+	/** The floor a point at height Z (Unreal cm, e.g. the visitor's feet) is on. */
+	int32 FloorIndexAt(float Z) const;
+	/** Landing places on floor FloorIndex for a visitor at plan position XY. */
+	FTwinFloorSpot FloorSpot(int32 FloorIndex, const FVector2D& XY) const;
 
 	bool IsReady() const { return State == ETwinLoadState::Ready; }
 	bool IsBusy() const { return State != ETwinLoadState::Ready && State != ETwinLoadState::Error && State != ETwinLoadState::Idle; }
@@ -130,6 +167,7 @@ public:
 	FTwinLaunch Launch;
 	TSharedPtr<FJsonObject> Manifest;
 	FTwinTelemetry Telemetry;
+	TArray<FTwinFloor> Floors;            // bottom first; one entry for a single build
 	TArray<FTwinBuildingEntry> Buildings;
 	FString BuildingsError;
 	bool bBuildingsLoading = false;
@@ -148,7 +186,9 @@ public:
 	FTwinViewerEvent OnUnloaded;         // the previous building's actors were removed
 
 	UPROPERTY()
-	TObjectPtr<ATwinAirflowActor> AirflowActor;
+	TObjectPtr<ATwinAirflowActor> AirflowActor;          // the first floor's (kept for single builds and callers)
+	UPROPERTY()
+	TArray<TObjectPtr<ATwinAirflowActor>> AirflowActors; // one per floor with HVAC
 
 	virtual void Tick(float DeltaSeconds) override;
 
@@ -181,6 +221,7 @@ private:
 	void FetchAirflow();
 	void ApplyTelemetry(const TSharedPtr<FJsonObject>& Json);
 	FString CachePath() const;
+	void ReadFloors();
 	UMaterialInterface* MaterialFor(int32 GltfMaterial) const;
 
 	TSharedPtr<TwinGltf::FModel> Model;
@@ -215,5 +256,6 @@ private:
 
 	class IImageWrapperModule* ImageWrappers = nullptr;
 	bool bNoCache = false;
+	float RoomLightScale = 0.25f;  // x the build's lumens (-TwinRoomLightScale=)
 	int64 MaxModelBytes = 1024ll * 1024 * 1024;
 };

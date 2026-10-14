@@ -152,7 +152,7 @@ def validate_scene(scene: Scene, brief: Brief | None = None) -> ValidationReport
                 continue
             boundary = poly.exterior
             uncovered = boundary.length if wall_cover is None else boundary.difference(wall_cover).length
-            if uncovered > 0.3 and r.type != "balcony":
+            if uncovered > 0.3 and r.type != "balcony" and not r.open_plan:
                 add("W_ROOM_EDGE_NO_WALL", "warning",
                     f"{uncovered:.2f} m of the '{r.name}' boundary has no wall (open-plan or missing wall?).",
                     f"room:{r.id}")
@@ -247,7 +247,8 @@ def validate_scene(scene: Scene, brief: Brief | None = None) -> ValidationReport
                             f"room:{rid}")
 
         # ---- furniture -----------------------------------------------------------
-        nets = {r.id: g.room_net_polygon(r, footprints) for r in rooms if r.id in room_polys}
+        walls_union = unary_union(list(footprints.values())) if footprints else Polygon()
+        nets = {r.id: g.room_net_polygon(r, footprints, walls_union) for r in rooms if r.id in room_polys}
         level_furniture = [fi for fi in scene.furniture if fi.room_id in room_polys]
         fps: dict[str, Polygon] = {}
         for fi in level_furniture:

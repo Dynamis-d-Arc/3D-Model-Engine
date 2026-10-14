@@ -3,7 +3,7 @@
 import { api, get, post } from "./api.js";
 import { refreshProject, switchTab, watchJob } from "./app.js";
 import { state, on, emit } from "./state.js";
-import { h, mount, toast, showError, badge, fmtBytes, fmtTime, fmtM, ask } from "./ui.js";
+import { h, mount, toast, showError, badge, fmtBytes, fmtTime, fmtM, ask, confirmDialog } from "./ui.js";
 
 let root;
 let viewer = null;
@@ -364,25 +364,41 @@ async function fixPicked(version, info) {
   } catch (e) { showError(e, "Fix with AI"); }
 }
 
+/** Hand a viewer launch document to the user: a .twinview download or the clipboard. */
+async function deliverLaunch(info, r, copy, what) {
+  const text = JSON.stringify(r.launch, null, 1);
+  if (copy) {
+    await navigator.clipboard.writeText(text);
+    toast("Launch code copied. In the desktop viewer press Ctrl+V.", "ok", 7000);
+  } else {
+    const a = h("a", { href: URL.createObjectURL(new Blob([text], { type: "application/json" })), download: r.file_name });
+    document.body.append(a);
+    a.click();
+    a.remove();
+  }
+  mount(info, h("div.notice.ok", null,
+    `Read-only link for ${what}, valid until ${new Date(r.expires_at * 1000).toLocaleString()}. `,
+    copy ? "Paste it into the viewer with Ctrl+V." : h("span", null, "Open it with ", h("code", null, `"Open Twin Viewer.cmd" "${r.file_name}"`), ".")));
+}
+
+/** "Open on this PC": the backend starts the packaged viewer on this computer (browser + server on the same PC). */
+async function openHere(info, url, body, what) {
+  try {
+    const r = await post(url, body);
+    if (!r.started) return toast("The viewer is already opening.", "info", 4000);
+    toast(`Opening ${what} in the Unreal viewer… (a few seconds)`, "ok", 6000);
+    mount(info, h("div.notice.ok", null, `The Unreal viewer (${r.viewer}) is starting on this PC with ${what}. `,
+      "H shows the controls; Esc quits."));
+  } catch (e) { showError(e, "Open on this PC"); }
+}
+
 /** Desktop viewer: a short-lived read-only link the packaged Unreal app opens (no editor needed anywhere). */
 function viewerSection(b) {
   const info = h("div");
+  const here = !!state.health?.desktop_viewer?.available;
   const launch = async (copy) => {
     try {
-      const r = await post(`/api/projects/${state.project.id}/viewer/launch`, { build_id: b.id });
-      const text = JSON.stringify(r.launch, null, 1);
-      if (copy) {
-        await navigator.clipboard.writeText(text);
-        toast("Launch code copied. In the desktop viewer press Ctrl+V.", "ok", 7000);
-      } else {
-        const a = h("a", { href: URL.createObjectURL(new Blob([text], { type: "application/json" })), download: r.file_name });
-        document.body.append(a);
-        a.click();
-        a.remove();
-      }
-      mount(info, h("div.notice.ok", null,
-        `Read-only link for this project, valid until ${new Date(r.expires_at * 1000).toLocaleString()}. `,
-        copy ? "Paste it into the viewer with Ctrl+V." : h("span", null, "Open it with ", h("code", null, `"Open Twin Viewer.cmd" "${r.file_name}"`), ".")));
+      deliverLaunch(info, await post(`/api/projects/${state.project.id}/viewer/launch`, { build_id: b.id }), copy, "this project");
     } catch (e) { showError(e, "Desktop viewer"); }
   };
   return h("div", null,
@@ -391,8 +407,96 @@ function viewerSection(b) {
       "furniture and HVAC details with live data, airflow illustration. The viewing PC needs no Unreal Editor or Blender; ",
       "the link holds a short-lived read-only token, never an API key."),
     h("div.row", null,
-      h("button.btn.primary", { onclick: () => launch(false) }, "Open in desktop viewer"),
+      here ? h("button.btn.primary", { onclick: () => openHere(info, `/api/projects/${state.project.id}/viewer/open-local`, { build_id: b.id }, "this build") },
+        "Open on this PC") : null,
+      h(here ? "button.btn" : "button.btn.primary", { onclick: () => launch(false) }, here ? "Download launch file" : "Open in desktop viewer"),
       h("button.btn", { onclick: () => launch(true) }, "Copy launch code")),
+    info,
+    stacksSection());
+}
+
+const MAX_FLOORS = 6;
+
+/** Multi-floor buildings: this project stacked with other floor projects, opened as one building in the viewer. */
+function stacksSection() {
+  const here = !!state.health?.desktop_viewer?.available;
+  const box = h("div", null, h("p.small.muted", null, "Loading multi-floor buildings…"));
+  const info = h("div");
+  const refresh = async () => {
+    try {
+      const stacks = await get(`/api/stacks?project_id=${encodeURIComponent(state.project.id)}`);
+      mount(box, stacks.length ? stacks.map(stackRow) : h("p.small.muted", null, "This floor is not part of a multi-floor building yet."));
+    } catch (e) { mount(box, h("div.notice.warn", null, `Multi-floor buildings: ${e.message}`)); }
+  };
+  const launch = async (st, copy) => {
+    try {
+      const r = await post(`/api/stacks/${st.id}/viewer/launch`, {});
+      deliverLaunch(info, r, copy, `${st.name} (${r.floors.length} floors)`);
+    } catch (e) { showError(e, "Multi-floor building"); }
+  };
+  const edit = async (st) => {
+    const projects = state.projects;
+    const opts = [["", "—"], ...projects.map((p) => [p.id, p.name])];
+    const floors = st ? st.floors : [{ project_id: state.project.id }];
+    const given = st && st.floors.length > 1 && st.floors.every((f, i) => f.elevation_m != null);
+    const step = given ? st.floors[1].elevation_m - st.floors[0].elevation_m : null;
+    const fields = [{ name: "name", label: "Building name", value: st ? st.name : state.project.name }];
+    for (let i = 0; i < MAX_FLOORS; i++) {
+      fields.push({ name: `f${i}`, label: i === 0 ? "Floor 1 (lowest)" : `Floor ${i + 1}`, options: opts, value: floors[i]?.project_id || "" });
+    }
+    fields.push({ name: "step", label: "Floor-to-floor height in metres (blank = automatic: walls or ceiling-void ducts + slab)",
+      type: "number", value: step ?? "" });
+    const v = await ask(st ? "Edit multi-floor building" : "New multi-floor building", fields, st ? "Save" : "Create");
+    if (!v) return;
+    const chosen = [];
+    for (let i = 0; i < MAX_FLOORS; i++) if (v[`f${i}`]) chosen.push(v[`f${i}`]);
+    if (chosen.length < 2) { toast("Choose at least two floors.", "warn", 5000); return; }
+    const old = st ? st.floors : [];
+    const body = { name: v.name || "Building", floors: chosen.map((pid, i) => {
+      const prev = old.find((f) => f.project_id === pid) || {};
+      return { project_id: pid, label: prev.label ?? null, offset_m: prev.offset_m ?? null,
+        elevation_m: v.step != null ? Math.round(i * v.step * 1000) / 1000 : null };
+    }) };
+    try {
+      const saved = st ? await api(`/api/stacks/${st.id}`, { method: "PUT", json: body }) : await post("/api/stacks", body);
+      toast(saved.plan_error ? saved.plan_error.message : `${saved.name}: ${saved.floors.length} floors stacked.`, saved.plan_error ? "warn" : "ok", 7000);
+      refresh();
+    } catch (e) { showError(e, "Multi-floor building"); }
+  };
+  const remove = async (st) => {
+    if (!(await confirmDialog("Delete multi-floor building", `Delete "${st.name}"? Its floors (projects and builds) are kept.`, "Delete"))) return;
+    try { await api(`/api/stacks/${st.id}`, { method: "DELETE" }); refresh(); } catch (e) { showError(e, "Multi-floor building"); }
+  };
+  const stackRow = (st) => {
+    const rows = st.plan ? st.plan.floors.map((f) => h("li", null,
+      h("b", null, f.label), ` ${f.project_name}, v${f.version} · floor at ${fmtM(f.elevation_m)} m`,
+      f.elevation_source === "stacked" ? h("span.muted", null, " (automatic)") : null,
+      f.alignment && f.alignment.method === "structural grid"
+        ? h("span.muted", null, ` · aligned on the structural grid (${f.alignment.matched.join(" + ")} lines)`)
+        : f.alignment && f.alignment.method !== "reference floor" ? h("span.muted", null, ` · placement: ${f.alignment.method}`) : null))
+      : st.floors.map((f, i) => h("li", null, `Floor ${i + 1}: ${st.project_names[f.project_id] || f.project_id}`));
+    return h("div.card", { style: { padding: "10px", marginTop: "8px" } },
+      h("div.row", null, h("b", null, st.name), h("span.small.muted", null, ` · ${st.floors.length} floors`)),
+      h("ul.small", null, rows),
+      ...(st.plan?.warnings || []).map((w) => h("div.notice.warn", null, w)),
+      st.plan_error ? h("div.notice.warn", null, st.plan_error.message) : null,
+      h("div.row", null,
+        here ? h("button.btn.primary", { disabled: !!st.plan_error,
+          onclick: () => openHere(info, `/api/stacks/${st.id}/viewer/open-local`, {}, `${st.name} (${st.floors.length} floors)`) }, "Open on this PC") : null,
+        h(here ? "button.btn" : "button.btn.primary", { disabled: !!st.plan_error, onclick: () => launch(st, false) },
+          here ? "Download launch file" : "Open in desktop viewer"),
+        h("button.btn", { disabled: !!st.plan_error, onclick: () => launch(st, true) }, "Copy launch code"),
+        h("button.btn", { onclick: () => edit(st) }, "Edit"),
+        h("button.btn", { onclick: () => remove(st) }, "Delete")));
+  };
+  refresh();
+  return h("div", null,
+    h("h3", null, "Multi-floor building"),
+    h("p.small.muted", null, "Stack this floor with the other floors of the building (each floor stays its own project). ",
+      "The viewer opens them as one building: PgUp / PgDn jump between floors. Floors are lined up on the structural ",
+      "grid of their floor plans and stacked so each floor's ceiling-void ducts fit under the next slab."),
+    box,
+    h("div.row", null, h("button.btn", { onclick: () => edit(null) }, "+ Multi-floor building")),
     info);
 }
 

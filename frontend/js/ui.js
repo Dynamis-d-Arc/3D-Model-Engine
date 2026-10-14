@@ -39,12 +39,33 @@ export function toast(message, kind = "info", ms = 5000) {
   setTimeout(() => t.remove(), ms);
 }
 
-/** Show an ApiError (or any error) with its code and details. */
+/** Show an ApiError (or any error) in words the user can act on; the code and details go to the console. */
 export function showError(err, context = "") {
-  const code = err && err.code ? ` [${err.code}]` : "";
-  toast(`${context ? context + ": " : ""}${err && err.message ? err.message : String(err)}${code}`, "error", 9000);
+  toast(`${context ? context + ": " : ""}${friendly(err)}`, "error", 9000);
   console.error(context, err);
 }
+
+/** Error codes in words a user can act on; technical detail stays in the Activity tab. */
+export function friendly(err) {
+  if (!err) return "Something went wrong.";
+  const d = err.detail || {};
+  const map = {
+    AI_BUDGET_EXCEEDED: () => `The AI spending limit is reached ($${(d.committed_usd ?? 0).toFixed(2)} of $${(d.cap_usd ?? 0).toFixed(2)} used). Nothing was charged. Raise TWIN_AI_BUDGET_USD in .env to continue.`,
+    AI_BUDGET_PRICES_MISSING: () => "The AI model's prices are not set, so the spending limit cannot be enforced. Nothing was sent.",
+    AI_NOT_CONFIGURED: () => "AI is not set up on this server (no key or model).",
+    AI_LIMIT_REACHED: () => "Today's AI request limit is reached. Try again tomorrow or raise TWIN_AI_DAILY_REQUEST_LIMIT.",
+    AI_AUTH: () => "The AI service rejected the API key. Check TWIN_AI_API_KEY.",
+    AI_RATE_LIMITED: () => "The AI service is busy. Wait a minute and try again.",
+    AI_TIMEOUT: () => "The AI took too long to answer. Try again.",
+    AI_UNAVAILABLE: () => "The AI service could not be reached. Check the internet connection and try again.",
+    AI_FIX_INVALID: () => "The AI's changes did not fit the model, so nothing was changed. Try describing the problem differently.",
+    AI_REFUSED: () => "The AI declined this request.",
+    AI_INCOMPLETE: () => "The AI's answer was cut off. Try again, or fix fewer problems at once.",
+    NETWORK: () => "The server is not reachable. Is it still running?",
+  };
+  return map[err.code] ? map[err.code]() : (err.message || String(err));
+}
+
 
 export function badge(text, kind = text) {
   return h("span.badge." + String(kind).replace(/[^a-z_]/gi, ""), null, String(text).replace(/_/g, " "));

@@ -12,7 +12,7 @@ import logging
 import os
 import re
 import shutil
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from pathlib import Path
 
@@ -76,6 +76,11 @@ def _detect_unreal() -> str | None:
     return candidates[0] if candidates else None
 
 
+SOLVER_DEFAULT_MODEL = "gpt-5.3-codex"
+# USD per 1M tokens (input, output), Standard tier, developers.openai.com/api/docs/pricing (checked 2026-10-14)
+SOLVER_PRICES: dict[str, tuple[float, float]] = {"gpt-5.3-codex": (1.75, 14.0)}
+
+
 @dataclass(frozen=True)
 class AISettings:
     api_key: SecretStr | None
@@ -93,10 +98,26 @@ class AISettings:
     price_output_per_1m: float | None = None  # USD per million output tokens (incl. reasoning) for `model`
     service_tier: str | None = "default"     # pinned so billing matches the configured (Standard) prices
     furniture_effort: str | None = "low"     # reasoning effort of the tiled furniture detection (cost driver)
+    # the AI problem solver (twin/ai/solve.py): a coding/reasoning model, same key and endpoint, own prices
+    solver_model: str | None = SOLVER_DEFAULT_MODEL
+    solver_price_input_per_1m: float | None = None    # None = the published price of the default solver model
+    solver_price_output_per_1m: float | None = None
+    solver_effort: str | None = "medium"
 
     @property
     def configured(self) -> bool:
         return self.api_key is not None and bool(self.api_key.get_secret_value()) and bool(self.model)
+
+    def solver(self) -> "AISettings":
+        """Settings for the problem solver: its model, prices and reasoning effort, the rest shared (key, endpoint,
+        spending cap). Prices default only for the default model; another model without prices fails closed."""
+        model = self.solver_model or self.model
+        known = SOLVER_PRICES.get(model or "", (None, None))
+        return replace(self, model=model, reasoning_effort=self.solver_effort,
+                       price_input_per_1m=self.solver_price_input_per_1m if self.solver_price_input_per_1m is not None
+                       else (known[0] if self.solver_model else self.price_input_per_1m),
+                       price_output_per_1m=self.solver_price_output_per_1m if self.solver_price_output_per_1m is not None
+                       else (known[1] if self.solver_model else self.price_output_per_1m))
 
     def public(self) -> dict:
         """Safe to show in the UI / logs: no secret material."""
@@ -104,7 +125,7 @@ class AISettings:
                 "key_source": self.key_source, "model": self.model, "api_style": self.api_style,
                 "endpoint_host": re.sub(r"^https?://([^/]+).*$", r"\1", self.base_url),
                 "budget_usd": self.budget_usd, "price_input_per_1m": self.price_input_per_1m,
-                "price_output_per_1m": self.price_output_per_1m}
+                "price_output_per_1m": self.price_output_per_1m, "solver_model": self.solver().model}
 
 
 @dataclass(frozen=True)
@@ -125,6 +146,7 @@ class Settings:
     viewer_token_ttl_h: float = 12.0
     public_url: str | None = None
     stream: "StreamSettings | None" = None
+    desktop_viewer_exe: str | None = None   # "Open on this PC" (twin/viewer/local.py); None = the packaged viewer in dist/
 
 
 @dataclass(frozen=True)
@@ -177,6 +199,12 @@ def load_settings(env: dict[str, str] | None = None, env_file: Path | None = ENV
         price_output_per_1m=_float_or_none(_lookup(env, fv, "TWIN_AI_PRICE_OUTPUT_PER_1M"), "TWIN_AI_PRICE_OUTPUT_PER_1M"),
         service_tier=_lookup(env, fv, "TWIN_AI_SERVICE_TIER", default="default") or None,
         furniture_effort=_lookup(env, fv, "TWIN_AI_FURNITURE_EFFORT", default="low") or None,
+        solver_model=_lookup(env, fv, "TWIN_AI_SOLVER_MODEL", default=SOLVER_DEFAULT_MODEL) or None,
+        solver_price_input_per_1m=_float_or_none(_lookup(env, fv, "TWIN_AI_SOLVER_PRICE_INPUT_PER_1M"),
+                                                 "TWIN_AI_SOLVER_PRICE_INPUT_PER_1M"),
+        solver_price_output_per_1m=_float_or_none(_lookup(env, fv, "TWIN_AI_SOLVER_PRICE_OUTPUT_PER_1M"),
+                                                  "TWIN_AI_SOLVER_PRICE_OUTPUT_PER_1M"),
+        solver_effort=_lookup(env, fv, "TWIN_AI_SOLVER_EFFORT", default="medium") or None,
     )
     if ai.api_style not in ("responses", "chat_completions"):
         raise ValueError("TWIN_AI_API_STYLE must be 'responses' or 'chat_completions'")
@@ -194,6 +222,7 @@ def load_settings(env: dict[str, str] | None = None, env_file: Path | None = ENV
         viewer_secret=SecretStr(v) if (v := _lookup(env, fv, "TWIN_VIEWER_SECRET")) else None,
         viewer_token_ttl_h=float(_lookup(env, fv, "TWIN_VIEWER_TOKEN_TTL_H", default="12")),
         public_url=(_lookup(env, fv, "TWIN_PUBLIC_URL") or "").rstrip("/") or None,
+        desktop_viewer_exe=_lookup(env, fv, "TWIN_DESKTOP_VIEWER_EXE") or None,
         stream=StreamSettings(
             enabled=_lookup(env, fv, "TWIN_STREAM_LOCAL", default="0") in ("1", "true", "yes"),
             # the game binary itself, not the Windows/TwinWalkthrough.exe launcher stub (which would outlive a stop)

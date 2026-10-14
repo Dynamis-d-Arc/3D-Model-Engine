@@ -35,4 +35,4 @@
 | Storage | object storage for uploads/builds, Postgres instead of SQLite, signed download URLs |
 | Jobs | external queue (e.g. Redis/RQ or Celery) and separate Blender/Unreal worker machines (GPU) |
 | Limits & cost | per-user quotas, token budgets, cost dashboard from `ai_calls` |
-| Unreal | packaged viewer done ([UNREAL_VIEWER.md](UNREAL_VIEWER.md)); next: Pixel Streaming (plan in that file), signed viewer releases, multi-level buildings |
+| Unreal | packaged viewer done ([UNREAL_VIEWER.md](UNREAL_VIEWER.md)); next: Pixel Streaming (plan in that file), signed viewer releases, walkable stairs between floors ([MULTI_FLOOR.md](MULTI_FLOOR.md)) |

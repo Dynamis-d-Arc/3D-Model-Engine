@@ -73,7 +73,9 @@ def test_full_flow_in_browser(server):
 
         # load the known-measurement layout -> review tab
         page.click("text=Use sample apartment")
-        page.wait_for_selector("text=ready to generate", timeout=15000)
+        page.wait_for_selector(".problems >> text=ready to build", timeout=15000)
+        assert page.locator(".problems", has_text="No problems found").count() == 1   # the checklist
+        assert page.locator("#nextStep", has_text="Build the 3D model").count() == 1    # the guided next step
         assert page.locator("svg text", has_text="Bedroom").count() == 1
         assert page.locator("svg text", has_text="3.85 × 3.45 m").count() == 1
         page.screenshot(path=str(OUT / "1_review.png"))

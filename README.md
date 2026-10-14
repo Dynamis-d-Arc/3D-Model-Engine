@@ -30,7 +30,8 @@ verification.
 | HVAC | HVAC drawing (vector PDF) → aligned on the structural grid → OCR + symbol detection → fan-coil units, diffusers, grilles and ducts placed, linked and built in 3D; **Fix with AI** (plain-language corrections → validated edit operations → new version); **Live HVAC** tab: an airflow illustration (one zone per AC unit) driven by MATLAB thermal results or live / simulated BMS data | synthetic detection/registration tests, airflow illustration tests in Node, mocked AI fix, API tests, optional private-drawing regression (`realdata`, tests/local) — see [docs/HVAC.md](docs/HVAC.md) |
 | Sensors | Sensor layer (temperature, humidity, CO2, pressure, occupancy, …): place on the plan or import a CSV placement sheet, validation, linked HVAC unit + BMS point; **update the saved 3D model in place** — the Blender build is reused byte for byte and only the sensors are written on top (seconds, no Blender); version change summaries, restore; live / simulated readings in the Live tab; sensors in the packaged Unreal viewer | unit + API tests without Blender, real Blender build tests, browser flow — see [docs/SENSORS.md](docs/SENSORS.md) |
 | Browser walkthrough | **Open in browser (Unreal)**: the packaged viewer streamed into the web app with Pixel Streaming 2 (local test: viewer + signalling server on this PC, 127.0.0.1 only); per-session build-scoped token kept on the server, idle / max-length session end | session manager tests with a stand-in viewer, loopback-binding test, manual stream check in headless Edge — see [docs/PIXEL_STREAMING.md](docs/PIXEL_STREAMING.md) |
-| 4–5 | Not started (multi-floor, stairs, accounts, deployment). See docs/OPERATIONS.md | – |
+| Multi-floor | Floor projects stacked into one building: floors lined up on the structural grid of their floor plans, stacked so each floor's ceiling-void ducts fit under the next slab; one merged model + manifest for the Unreal viewer, **PgUp / PgDn** jumps floors, cutaway view, per-floor airflow and live data | merge/alignment/API tests without Unreal, packaged-viewer floor-jump tour — see [docs/MULTI_FLOOR.md](docs/MULTI_FLOOR.md) |
+| 4–5 | Not started (walkable stairs between floors, accounts, deployment). See docs/OPERATIONS.md | – |
 
 ## Quick start (Windows)
 
@@ -83,9 +84,11 @@ on a completed build, or see [docs/UNREAL.md](docs/UNREAL.md) for manual steps.
    upload the plan (and style references).
 2. Create a layout: **Interpret with AI**, **Start from overall dimensions** (trace manually), or
    **Use sample apartment** (known measurements).
-3. **Review layout** – calibrate the plan image (click a known dimension, then the origin), draw or
-   adjust rooms (shared corners move together), derive walls, add doors/windows/furniture, confirm
-   or accept estimated measurements, answer AI questions, **Save version**.
+3. **Review layout** – the **Problems** checklist groups what is wrong in plain words; **Fix problems
+   automatically** fixes the mechanical ones for free and sends the rest to the AI problem solver
+   (gpt-5.3-codex), saving one new version to look at (docs/PROBLEMS.md). Calibrate the plan image, draw or
+   adjust rooms (shared corners move together), add doors/windows/furniture, confirm or accept estimated
+   measurements, answer AI questions, **Save version**. The bar under the tabs always says what to do next.
 4. **Generate & preview** – Blender builds and verifies; preview the GLB, view renders, download
    the `.blend`, the Unreal bundle, FBX/GLB, manifest and reports.
 5. **HVAC (optional)** – upload the HVAC drawing in step 1, *Import HVAC drawing* in Review, accept the
@@ -119,5 +122,6 @@ on a completed build, or see [docs/UNREAL.md](docs/UNREAL.md) for manual steps.
 - [docs/TESTING.md](docs/TESTING.md) – automated vs mocked vs real integration tests
 - [docs/OPERATIONS.md](docs/OPERATIONS.md) – running, security, data, roadmap to a service
 - [docs/HVAC.md](docs/HVAC.md) – HVAC drawing import, Fix with AI, live data API, airflow simulation
+- [docs/PROBLEMS.md](docs/PROBLEMS.md) – the Problems checklist, free rule fixes, the AI problem solver (gpt-5.3-codex), costs, API
 - [docs/SENSORS.md](docs/SENSORS.md) – the build-once / update-in-place flow, sensor model, layer builds, CSV sheet, API
 - [docs/PIXEL_STREAMING.md](docs/PIXEL_STREAMING.md) – the Unreal walkthrough streamed into the browser (local test), security model, hosting plan and costs

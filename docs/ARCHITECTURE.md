@@ -14,6 +14,7 @@
 | Blender worker | `twin/blender/` + `twin/pipeline.py` | library build, scene build, export, re-import verification, manifest |
 | Unreal | `twin/unreal/` + `unreal/TwinWalkthrough/` | C++ walkthrough + **packaged desktop viewer** (runtime glTF loading, no editor), optional editor import commandlet, tour, packaging (`twin/unreal/package.py`) |
 | Viewer API | `twin/viewer/` | read-only `/api/viewer/v1` for the packaged viewer: signed short-lived viewer tokens, viewer manifest + glTF pre-flight, HVAC live data / airflow illustration in Unreal space — see [UNREAL_VIEWER.md](UNREAL_VIEWER.md) |
+| Multi-floor buildings | `twin/viewer/stacks.py` | floor projects stacked into one building: grid alignment, floor heights, one merged glTF + viewer manifest per composite, `/api/stacks` — see [MULTI_FLOOR.md](MULTI_FLOOR.md) |
 
 ## Data flow
 
