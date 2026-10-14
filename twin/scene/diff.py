@@ -12,6 +12,8 @@ from typing import Any
 from twin.scene.model import FurnitureItem, Material, RoomFinishes, Scene
 
 COLLECTIONS = ("levels", "rooms", "walls", "openings", "furniture", "materials", "open_questions")
+NESTED = {"hvac_units": ("hvac", "units"), "hvac_terminals": ("hvac", "terminals"), "ducts": ("hvac", "ducts"),
+          "sensors": ("sensors",)}
 SINGLETONS = ("project", "lighting")
 
 
@@ -19,13 +21,20 @@ class ScopeViolation(ValueError):
     pass
 
 
+def _items(d: dict, path: tuple[str, ...]) -> list[dict]:
+    for k in path:
+        d = d[k]
+    return d  # type: ignore[return-value]
+
+
 def diff_scenes(a: Scene, b: Scene) -> dict[str, Any]:
     """Per-collection added / removed / changed ids, plus changed singleton sections."""
     out: dict[str, Any] = {}
     da, db = a.model_dump(mode="json"), b.model_dump(mode="json")
-    for coll in COLLECTIONS:
-        ia = {e["id"]: e for e in da[coll]}
-        ib = {e["id"]: e for e in db[coll]}
+    paths = {c: (c,) for c in COLLECTIONS} | NESTED
+    for coll, path in paths.items():
+        ia = {e["id"]: e for e in _items(da, path)}
+        ib = {e["id"]: e for e in _items(db, path)}
         changed = {}
         for k in sorted(ia.keys() & ib.keys()):
             if ia[k] != ib[k]:
@@ -37,6 +46,19 @@ def diff_scenes(a: Scene, b: Scene) -> dict[str, Any]:
         if da[key] != db[key]:
             out[key] = sorted(f for f in set(da[key]) | set(db[key]) if da[key].get(f) != db[key].get(f))
     return out
+
+
+def change_summary(a: Scene, b: Scene) -> dict[str, Any]:
+    """Counts of what changed from a to b, and whether the building itself changed (a regeneration) or
+    only layers such as sensors (an in-place update of the saved model)."""
+    from twin.scene.sensors import geometry_key
+    d = diff_scenes(a, b)
+    counts = {k: {"added": len(v["added"]), "removed": len(v["removed"]), "changed": len(v["changed"])}
+              for k, v in d.items() if isinstance(v, dict)}
+    sections = sorted(k for k, v in d.items() if not isinstance(v, dict))
+    geometry = geometry_key(a) != geometry_key(b)
+    return {"counts": counts, "sections": sections, "geometry_changed": geometry,
+            "layers_only": not geometry and bool(counts or sections)}
 
 
 def rooms_touched(a: Scene, b: Scene) -> set[str]:
@@ -59,7 +81,7 @@ def rooms_touched(a: Scene, b: Scene) -> set[str]:
 def assert_only_rooms_changed(a: Scene, b: Scene, allowed_rooms: set[str]) -> None:
     d = diff_scenes(a, b)
     problems: list[str] = []
-    for coll in ("levels", "walls", "openings", "open_questions"):
+    for coll in ("levels", "walls", "openings", "open_questions", *NESTED):
         if coll in d:
             problems.append(f"{coll} changed: {d[coll]}")
     for key in SINGLETONS:

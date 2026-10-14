@@ -330,6 +330,31 @@ class Hvac(_Strict):
     source: HvacSource = Field(default_factory=HvacSource)
 
 
+SensorKind = Literal["temperature", "humidity", "temp_humidity", "co2", "pressure", "occupancy", "airflow",
+                     "energy", "other"]
+SensorMounting = Literal["wall", "ceiling", "free"]
+
+
+class Sensor(_Strict):
+    """A monitoring point added to the twin (often after the building was generated). ``position`` is the
+    sensor's plan location; ``elevation`` is its centre height above the level floor (None = the mounting
+    default: 1.5 m on a wall or free-standing, just under the room ceiling when ceiling-mounted).
+    ``unit_id`` links it to the HVAC unit it monitors and ``bms_point`` to the live data feed."""
+
+    id: Id
+    tag: str = Field(min_length=1, max_length=40, description="tag on site / in the BMS, e.g. 'TS-01'")
+    kind: SensorKind = "temperature"
+    level_id: Id
+    room_id: Id | None = None
+    position: Vec2
+    elevation: float | None = Field(default=None, ge=0.0, le=12.0)
+    mounting: SensorMounting = "wall"
+    unit_id: Id | None = Field(default=None, description="HVAC unit this sensor monitors")
+    bms_point: str = Field(default="", max_length=120, description="BMS / IoT point name of the live reading")
+    label: str = Field(default="", max_length=80)
+    certainty: Certainty = Field(default_factory=Certainty)
+
+
 class Provenance(_Strict):
     source: Source = "manual"
     ai_model: str | None = None
@@ -355,6 +380,7 @@ class Scene(_Strict):
     open_questions: list[OpenQuestion] = Field(default_factory=list, max_length=200)
     provenance: Provenance = Field(default_factory=Provenance)
     hvac: Hvac = Field(default_factory=Hvac)
+    sensors: list[Sensor] = Field(default_factory=list, max_length=4000)
 
     @model_validator(mode="after")
     def _references(self) -> "Scene":
@@ -402,6 +428,14 @@ class Scene(_Strict):
                     errors.append(f"{kind} {it.id}: unknown room '{it.room_id}'")
                 if getattr(it, "unit_id", None) is not None and it.unit_id not in unit_ids:
                     errors.append(f"{kind} {it.id}: unknown unit '{it.unit_id}'")
+        unique("sensor", [s.id for s in self.sensors])
+        for s in self.sensors:
+            if s.level_id not in level_ids:
+                errors.append(f"sensor {s.id}: unknown level '{s.level_id}'")
+            if s.room_id is not None and s.room_id not in room_ids:
+                errors.append(f"sensor {s.id}: unknown room '{s.room_id}'")
+            if s.unit_id is not None and s.unit_id not in unit_ids:
+                errors.append(f"sensor {s.id}: unknown unit '{s.unit_id}'")
         if errors:
             raise ValueError("; ".join(errors))
         return self

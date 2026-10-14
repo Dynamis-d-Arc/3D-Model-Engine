@@ -12,7 +12,8 @@
 | Geometry | `twin/scene/{geometry,validate,compile,derive,diff,transforms,styles,textures}.py` | validation, deterministic mesh plan, editing helpers, conversions |
 | Assets | `twin/assets/catalog.json` | furniture contract shared by AI, compiler and Blender |
 | Blender worker | `twin/blender/` + `twin/pipeline.py` | library build, scene build, export, re-import verification, manifest |
-| Unreal | `twin/unreal/` + `unreal/TwinWalkthrough/` | import commandlet, C++ walkthrough template, tour, launch |
+| Unreal | `twin/unreal/` + `unreal/TwinWalkthrough/` | C++ walkthrough + **packaged desktop viewer** (runtime glTF loading, no editor), optional editor import commandlet, tour, packaging (`twin/unreal/package.py`) |
+| Viewer API | `twin/viewer/` | read-only `/api/viewer/v1` for the packaged viewer: signed short-lived viewer tokens, viewer manifest + glTF pre-flight, HVAC live data / airflow illustration in Unreal space — see [UNREAL_VIEWER.md](UNREAL_VIEWER.md) |
 
 ## Data flow
 
@@ -25,9 +26,16 @@
 4. **Generate** (Blender job): `compile_scene` turns the version into a build plan (prisms with cap
    triangulations, furniture placements, lights, cameras, expected bounds, content hashes). Blender
    builds, saves, exports; a second Blender process re-imports every export; the backend compares
-   Blender's report and the re-import report with the plan (1 mm tolerance). Only then is the build
-   `completed` and `manifest.json` written.
-5. **Unreal** (job): the headless editor imports per-object FBX (skipping meshes whose content hash is
+   Blender's report and the re-import report with the plan (1 mm tolerance). Blender's glTF is kept as
+   `export/web/geometry.glb` and `export/web/scene.glb` = geometry + the sensor layer (`twin/layers.py`).
+   Only then is the build `completed` and `manifest.json` written.
+4b. **Update in place** (layer build, no Blender): a version whose building is identical to a saved build's
+   (only sensors changed) reuses that build's files through hard links and rewrites only the sensor layer —
+   seconds instead of minutes. See [SENSORS.md](SENSORS.md).
+5. **Desktop viewer** (no job, no editor): the web app mints a read-only viewer token; the packaged viewer
+   downloads the build's verified glTF + viewer manifest over `/api/viewer/v1`, builds the walkthrough at
+   runtime and re-checks every actor against the scene model ([UNREAL_VIEWER.md](UNREAL_VIEWER.md)).
+6. **Unreal editor import** (optional developer job): the headless editor imports per-object FBX (skipping meshes whose content hash is
    already imported), builds `L_Walkthrough`, verifies every actor's bounds against the scene model,
    then the scripted tour checks navigation, collision and selection and captures screenshots.
 
@@ -46,11 +54,15 @@ twin.sqlite                         projects, files, versions, jobs, builds, ai_
 projects/<p_id>/uploads/<f_id>/     original.<ext>, normalized.png, thumb.png
 projects/<p_id>/versions/vNNNN.json immutable scene versions
 projects/<p_id>/builds/<b_id>/      plan.json, scene.json, scene.blend, export/…, preview/…,
-                                    blender_report.json, verify_report.json, manifest.json, unreal/…
+                                    export/web/geometry.glb (Blender) + scene.glb (+ layers), sensors.json,
+                                    blender_report.json, verify_report.json, layer_report.json, manifest.json, unreal/…
 ```
 
 Builds belong to one project version and live in their own directory, so a later build never touches
-an earlier one. Reuse across builds is explicit: `reuse.json` lists the exports copied from the
+an earlier one. `builds.kind` is `full` (Blender) or `layer` (a saved build reused with new layers;
+`previous_build` = the build it updates, `manifest.geometry_build` = the Blender build the geometry comes
+from). Layer builds hard-link the files they reuse; nothing in a build directory is modified after it
+completes, so the links are safe. Versions store `changes` against their parent. Reuse across builds is explicit: `reuse.json` lists the exports copied from the
 previous build because their content hash is unchanged.
 
 ## Regenerating a room

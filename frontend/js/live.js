@@ -66,7 +66,7 @@ class LiveView {
     this.cut = true;
     this.pickables = [];
     this.unitMeshes = new Map();
-    this.groups = { walls: [], openings: [], floors: [], furniture: [], units: [], ducts: [], terminals: [] };
+    this.groups = { walls: [], openings: [], floors: [], furniture: [], units: [], ducts: [], terminals: [], sensors: [] };
     this.highlight = null;
     this.raycaster = new THREE.Raycaster();
     this.muted = new Set();
@@ -97,10 +97,12 @@ class LiveView {
     this.camera.updateProjectionMatrix();
   }
 
+  /** Object name of a mesh: the topmost ancestor with a twin prefix (glTF meshes with several materials load as a
+   * group named after the object whose parts are called <name>_1, <name>_2, …). */
   topName(o) {
-    let x = o;
-    while (x && !/^(ARCH|FURN|HVAC)_/.test(x.name || "") && x.parent) x = x.parent;
-    return x?.name || o.name || "";
+    let best = null;
+    for (let x = o; x && x !== this.root; x = x.parent) if (/^(ARCH|FURN|HVAC|SENSOR)_/.test(x.name || "")) best = x.name;
+    return best || o.name || "";
   }
 
   /** The generated GLB with its built materials. */
@@ -127,6 +129,7 @@ class LiveView {
         this.pickables.push(m);
       } else if (/^HVAC_Duct_/.test(top)) { this.groups.ducts.push(m); this.pickables.push(m); }
       else if (/^HVAC_(Diffuser|Grille)_/.test(top)) { this.groups.terminals.push(m); this.pickables.push(m); }
+      else if (/^SENSOR_/.test(top)) { this.groups.sensors.push(m); this.pickables.push(m); }
     }
     for (const m of [...this.groups.walls, ...this.groups.openings]) {
       for (const mat of Array.isArray(m.material) ? m.material : [m.material]) mat.side = THREE.DoubleSide;
@@ -202,6 +205,14 @@ class LiveView {
       const z = placement[t.id];
       const sup = t.kind.startsWith("supply") || t.kind === "linear_slot";
       const m = box(`HVAC_${sup ? "Diffuser" : "Grille"}_${t.id}`, t.position[0], t.position[1], z.z0, z.z1, t.width, t.depth, t.rotation_deg, tMat, "terminals");
+      this.pickables.push(m);
+    }
+    const kindColor = Object.fromEntries((catalog?.sensor_kinds || []).map((k) => [k.id, k.color]));
+    for (const se of scene.sensors || []) {   // the sensor layer: small discs (the build's markers are 12 cm pucks)
+      const top = placement[se.id]?.z1 ?? lv.elevation + lv.wall_height;
+      const zc = se.mounting === "ceiling" && se.elevation == null ? top - 0.07 : lv.elevation + (se.elevation ?? 1.5);
+      const m = box(`SENSOR_${se.id}`, se.position[0], se.position[1], zc - 0.06, zc + 0.06, 0.13, 0.13, 0,
+        new THREE.MeshStandardMaterial({ color: kindColor[se.kind] || 0x6f7782, emissive: kindColor[se.kind] || 0x6f7782, emissiveIntensity: 0.4 }), "sensors");
       this.pickables.push(m);
     }
     this.scene.add(this.root);
@@ -315,11 +326,42 @@ class LiveView {
     this.camera.position.copy(target.clone().add(off));
   }
 
+  /** Screen-sized pins over the sensor markers (drawn on top: a 12 cm puck is invisible from a whole-floor view). */
+  addSensorPins(sensors, colors) {
+    const tex = {};
+    const b = new THREE.Box3();
+    for (const se of sensors) {
+      const mesh = this.groups.sensors.find((m) => this.topName(m) === `SENSOR_${se.id}`);
+      if (!mesh) continue;
+      const color = colors[se.kind] || "#6F7782";
+      if (!tex[color]) {
+        const c = document.createElement("canvas");
+        c.width = c.height = 64;
+        const g = /** @type {CanvasRenderingContext2D} */ (c.getContext("2d"));
+        g.beginPath(); g.arc(32, 32, 27, 0, Math.PI * 2); g.fillStyle = "#ffffff"; g.fill();
+        g.beginPath(); g.arc(32, 32, 20, 0, Math.PI * 2); g.fillStyle = color; g.fill();
+        tex[color] = new THREE.CanvasTexture(c);
+        tex[color].colorSpace = THREE.SRGBColorSpace;
+      }
+      const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex[color], depthTest: false, sizeAttenuation: false, transparent: true }));
+      b.setFromObject(mesh).getCenter(sp.position);
+      sp.position.y += 0.1;
+      sp.scale.set(0.026, 0.026, 1);
+      sp.renderOrder = 999;
+      sp.name = `SENSOR_${se.id}`;
+      this.scene.add(sp);
+      this.groups.sensors.push(sp);
+      this.pickables.push(sp);
+    }
+  }
+
   pick(e) {
     const r = this.renderer.domElement.getBoundingClientRect();
     const ndc = new THREE.Vector2(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1);
     this.raycaster.setFromCamera(ndc, this.camera);
-    const hit = this.raycaster.intersectObjects(this.pickables.filter((m) => m.visible), false)[0];
+    const pins = this.pickables.filter((m) => m.visible && /** @type {any} */ (m).isSprite);
+    const hit = this.raycaster.intersectObjects(pins, false)[0] ||
+      this.raycaster.intersectObjects(this.pickables.filter((m) => m.visible && !(/** @type {any} */ (m).isSprite)), false)[0];
     if (this.highlight) { this.scene.remove(this.highlight); this.highlight = null; }
     if (!hit) return this.onPick(null);
     const name = this.topName(hit.object);
@@ -423,6 +465,7 @@ async function start(pid, number, versions) {
   } catch (e) { showError(e, "3D model"); s.view.buildFromScene(ver.scene, placementFromModel(ver.scene, s.model), state.catalog); }
   if (session !== s) return;
   s.buildNote = build ? `build ${build.id.slice(2)}` : "simple extrusion (generate a build for the full model)";
+  s.view.addSensorPins(ver.scene.sensors || [], Object.fromEntries((state.catalog.sensor_kinds || []).map((k) => [k.id, k.color])));
   s.view.airflow = createAirflow(s.view.scene, { onGhost: (on) => s.view.ghost(on) });
   s.view.setupHeatPlane(s.model);
   s.view.setCut(prefs.cut);
@@ -674,7 +717,21 @@ function drawSide(s) {
           h("td", null, cells.dot, u.tag), cells.sp, cells.sup, cells.room, cells.cloud);
       }))));
   const alarms = s.live ? units.filter((u) => r?.units?.[u.id]?.alarm).map((u) => h("div.notice.warn", null, h("b", null, u.tag), ": ", r.units[u.id].alarm)) : [];
-  mount(s.side, head, driver, alarms.length ? h("div.card", null, h("h2", null, "Alarms"), ...alarms) : null, unitTable, uploadCard,
+  const sensors = s.scene.sensors || [];
+  ui.sensorCells = new Map();
+  const kinds = Object.fromEntries((state.catalog.sensor_kinds || []).map((k) => [k.id, k]));
+  const sensorTable = sensors.length ? h("div.card", null, h("h2", null, `Sensors (${sensors.length})`),
+    h("table.simple.live-units", null,
+      h("thead", null, h("tr", null, h("th", null, "Sensor"), h("th", null, "Reading"), h("th", null, "Room"), h("th", null, "Source"))),
+      h("tbody", null, sensors.map((x) => {
+        const cells = { value: h("td"), src: h("td.small.muted") };
+        ui.sensorCells.set(x.id, cells);
+        return h("tr", { class: s.picked === `sensor:${x.id}` ? "sel" : "", title: `${kinds[x.kind]?.label || x.kind}${x.bms_point ? ` · ${x.bms_point}` : ""}`,
+          onclick: () => focusSensor(s, x.id) },
+          h("td", null, h("span.sensor-dot", { style: { background: kinds[x.kind]?.color, marginRight: "6px" } }), x.tag), cells.value,
+          h("td.small", null, s.roomsById[x.room_id || r?.sensors?.[x.id]?.room_id]?.name || "–"), cells.src);
+      })))) : null;
+  mount(s.side, head, driver, alarms.length ? h("div.card", null, h("h2", null, "Alarms"), ...alarms) : null, sensorTable, unitTable, uploadCard,
     h("p.small.muted", null, "Illustrative airflow: one zone per AC unit; clouds combine the zone ",
       "temperatures with assumed cooling jets from each casing's discharge face; white tracers show illustrative circulation. ",
       "Outlet directions, wall interactions and turbulence are not solved. Not CFD."));
@@ -716,6 +773,41 @@ function fillSide(s) {
     c.room.textContent = s.live ? fmtC(rd.room_temp_c ?? rd.return_air_c) : "–";
     c.cloud.textContent = v == null ? "not drawn" : fmtC(v);
   }
+  for (const [id, c] of ui.sensorCells || []) {
+    const rd = r?.sensors?.[id];
+    c.value.textContent = rd ? sensorValue(rd) : "–";
+    c.src.textContent = rd ? (rd.source === "live" ? "live" : "simulated") : "";
+  }
+}
+
+function sensorValue(rd) {
+  const v = rd.value;
+  const txt = rd.unit === "°C" ? `${v.toFixed(1)} °C` : rd.unit === "%RH" ? `${v.toFixed(0)} %RH` : rd.unit === "ppm" ? `${v.toFixed(0)} ppm`
+    : rd.unit === "people" ? `${Math.round(v)} people` : `${v.toFixed(1)} ${rd.unit}`;
+  return txt + (rd.humidity != null ? ` · ${rd.humidity.toFixed(0)} %RH` : "");
+}
+
+function focusSensor(s, id) {
+  const x = (s.scene.sensors || []).find((y) => y.id === id);
+  if (!x) return;
+  s.picked = `sensor:${id}`;
+  s.view.focus(x.position[0], x.position[1], 2.0);
+  showSensor(s, id);
+  drawSide(s);
+}
+
+function showSensor(s, id) {
+  const el = s.view.container.querySelector(".picked");
+  const x = (s.scene.sensors || []).find((y) => y.id === id);
+  if (!x || !el) return;
+  const rd = s.readings?.sensors?.[id];
+  const k = (state.catalog.sensor_kinds || []).find((y) => y.id === x.kind);
+  const u = x.unit_id ? s.unitsById[x.unit_id] : null;
+  el.classList.remove("hidden");
+  mount(el, h("b", null, `${k?.label || x.kind} ${x.tag}`),
+    h("div", null, rd ? `${sensorValue(rd)} · ${rd.source === "live" ? "live reading" : "simulated"} ${fmtTime(rd.ts)}` : "no reading"),
+    h("div", null, `Monitors: ${u ? u.tag : "no unit"} · BMS point: ${x.bms_point || "not set"}`),
+    (x.room_id || rd?.room_id) ? h("div.small.muted", null, `Room: ${s.roomsById[x.room_id || rd.room_id]?.name || x.room_id}`) : null);
 }
 
 async function uploadResults(s, file) {
@@ -768,6 +860,7 @@ function onPick(s, hit, el) {
   const name = hit.name;
   let m;
   if ((m = /^HVAC_Unit_(.+)$/.exec(name))) { s.picked = m[1]; return showUnit(s, m[1]); }
+  if ((m = /^SENSOR_(.+)$/.exec(name))) { s.picked = `sensor:${m[1]}`; return showSensor(s, m[1]); }
   el.classList.remove("hidden");
   const terminal = /^HVAC_(Diffuser|Grille)_(.+)$/.exec(name);
   const floor = /^ARCH_Floor_(.+)$/.exec(name);

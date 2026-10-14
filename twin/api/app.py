@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, ValidationError
 from starlette.background import BackgroundTask
@@ -32,9 +32,13 @@ from twin.config import PROJECT_ROOT, Settings, get_settings, install_log_redact
 from twin.fixtures import load_sample_apartment
 from twin.imaging.pdf_text import calibration_for, extract_pdf_text
 from twin.imaging.preprocess import UploadRejected, normalize_upload
+from twin.layers import run_layer_build
 from twin.pipeline import run_build
 from twin.scene import derive
 from twin.scene.compile import scene_hash
+from twin.scene.diff import change_summary, diff_scenes
+from twin.scene.sensors import (KIND_COLORS, KIND_LABELS, KIND_UNITS, SHEET_TEMPLATE, TAG_PREFIX, geometry_key,
+                                import_sheet, layer_changes)
 from twin.scene.model import (Brief, Certainty, Level, NEEDS_REVIEW_STATUSES, ProjectMeta, Provenance, Room, Scene,
                               Wall, scene_json_schema)
 from twin.scene.styles import BUILTIN_MATERIALS, STYLES
@@ -106,6 +110,16 @@ class InterpretBody(BaseModel):
 class BuildBody(BaseModel):
     render_previews: bool = True
     reuse_previous: bool = True
+    mode: Literal["full", "layer", "auto"] = Field(
+        default="full", description="full = generate with Blender; layer = reuse a saved build whose building is "
+                                    "identical and rewrite only its layers (sensors); auto = layer when possible")
+    base_build: str | None = Field(default=None, description="layer/auto: the saved build to update (default: the "
+                                                             "newest completed build with the same building)")
+
+
+class SensorSheetBody(BaseModel):
+    scene: dict
+    text: str = Field(max_length=2_000_000, description="CSV placement sheet")
 
 
 class RedesignBody(BaseModel):
@@ -162,6 +176,8 @@ def create_app(settings: Settings | None = None, ai_transport=None) -> FastAPI:
     async def lifespan(_app: FastAPI):
         yield
         jobs.shutdown()
+        if getattr(app.state, "streamer", None) is not None:
+            app.state.streamer.shutdown()   # streamed viewer processes + the signalling server
 
     app = FastAPI(title="Floor plan -> 3D digital twin", version=__version__, lifespan=lifespan)
     app.state.settings, app.state.storage, app.state.jobs = settings, storage, jobs
@@ -211,7 +227,8 @@ def create_app(settings: Settings | None = None, ai_transport=None) -> FastAPI:
                                    f"UnrealEditor-{settings.unreal_project.stem}.dll").is_file()}
         return {"version": __version__, "ai": settings.ai.public(), "blender": blender, "unreal": unreal,
                 "ai_usage_today": storage.ai_usage_today(), "ai_daily_limit": settings.ai.daily_request_limit,
-                "ai_budget": budget().status()}
+                "ai_budget": budget().status(),
+                "streaming": app.state.streamer.status() if getattr(app.state, "streamer", None) else None}
 
     @app.get("/api/catalog")
     def catalog() -> dict:
@@ -223,6 +240,8 @@ def create_app(settings: Settings | None = None, ai_transport=None) -> FastAPI:
             "materials": [{"id": m.id, "name": m.name, "base_color": m.base_color, "pattern": m.pattern}
                           for m in BUILTIN_MATERIALS.values()],
             "room_types": list(Room.model_fields["type"].annotation.__args__),
+            "sensor_kinds": [{"id": k, "label": v, "unit": KIND_UNITS[k], "color": KIND_COLORS[k], "prefix": TAG_PREFIX[k]}
+                             for k, v in KIND_LABELS.items()],
         }
 
     @app.get("/api/schema/scene")
@@ -303,9 +322,29 @@ def create_app(settings: Settings | None = None, ai_transport=None) -> FastAPI:
     # ---- scene versions ----------------------------------------------------------------------
     def store_version(pid: str, scene: Scene, source: str, note: str, parent: int | None) -> dict:
         report = validate_scene(scene, storage.brief(pid))
+        changes = None
+        if parent is not None:
+            try:
+                old = storage.load_scene(pid, parent)
+                changes = {**change_summary(old, scene), "sensors": layer_changes(old, scene)}
+            except NotFound:
+                pass
         meta = storage.add_version(pid, scene, source=source, note=note, parent=parent,
-                                   validation=report.model_dump(mode="json"), scene_hash=scene_hash(scene))
+                                   validation=report.model_dump(mode="json"), scene_hash=scene_hash(scene),
+                                   changes=changes)
         return {**meta, "scene": scene.model_dump(mode="json")}
+
+    @app.get("/api/projects/{pid}/versions/{number}/changes")
+    def version_changes(pid: str, number: int, against: int | None = None) -> dict:
+        """What changed from version `against` (default: the parent) to `number`: per-collection ids, counts,
+        the sensor layer changes, and whether the building itself changed."""
+        meta = storage.get_version_meta(pid, number)
+        other = against if against is not None else meta["parent"]
+        if other is None:
+            raise ApiError(404, "NO_PARENT", f"v{number} has no parent version; pass ?against=<version>.")
+        a, b = storage.load_scene(pid, other), storage.load_scene(pid, number)
+        return {"from": other, "to": number, **change_summary(a, b), "sensors": layer_changes(a, b),
+                "detail": diff_scenes(a, b)}
 
     @app.get("/api/projects/{pid}/versions")
     def versions(pid: str) -> list[dict]:
@@ -370,7 +409,7 @@ def create_app(settings: Settings | None = None, ai_transport=None) -> FastAPI:
         """Mark every remaining estimated/extracted value as a knowingly accepted estimate."""
         data = parse_scene(body.scene).model_dump(mode="json")
         changed = 0
-        groups = [data[c] for c in ("levels", "rooms", "walls", "openings", "furniture")]
+        groups = [data[c] for c in ("levels", "rooms", "walls", "openings", "furniture", "sensors")]
         groups += [data["hvac"][c] for c in ("units", "terminals", "ducts")]
         for coll in groups:
             for el in coll:
@@ -378,6 +417,18 @@ def create_app(settings: Settings | None = None, ai_transport=None) -> FastAPI:
                     el["certainty"]["status"] = "accepted_estimate"
                     changed += 1
         return {"scene": data, "changed": changed}
+
+    @app.post("/api/scene/import-sensors")
+    def import_sensors(body: SensorSheetBody) -> dict:
+        """Merge a CSV sensor placement sheet into the scene (not saved: the editor shows the result as
+        unsaved edits to check before saving a new version)."""
+        scene, info = import_sheet(parse_scene(body.scene), body.text)
+        return {"scene": scene.model_dump(mode="json"), **info}
+
+    @app.get("/api/sensors/template.csv", include_in_schema=False)
+    def sensor_template():
+        return Response(SHEET_TEMPLATE, media_type="text/csv",
+                        headers={"Content-Disposition": 'attachment; filename="sensor_placement_template.csv"'})
 
     # ---- AI jobs -----------------------------------------------------------------------------
     def require_ai() -> None:
@@ -581,6 +632,90 @@ def create_app(settings: Settings | None = None, ai_transport=None) -> FastAPI:
         return jobs.submit(pid, "furniture", body.model_dump(), run, version=number)
 
     # ---- builds ------------------------------------------------------------------------------
+    geometry_keys: dict[str, str | None] = {}   # build id -> geometry key of its scene (builds are immutable)
+    geometry_lock = threading.Lock()
+
+    def build_scene(pid: str, bid: str) -> Scene | None:
+        path = storage.build_dir(pid, bid) / "scene.json"
+        try:
+            return Scene.model_validate_json(path.read_text(encoding="utf-8"))
+        except (OSError, ValidationError, ValueError):
+            return None
+
+    def build_geometry_key(pid: str, bid: str) -> str | None:
+        with geometry_lock:
+            if bid not in geometry_keys:
+                s = build_scene(pid, bid)
+                geometry_keys[bid] = geometry_key(s) if s is not None else None
+            return geometry_keys[bid]
+
+    def layer_base(pid: str, scene: Scene, preferred: str | None = None) -> dict | None:
+        """Newest completed build with exactly this building (its model can take the new layers as is)."""
+        key = geometry_key(scene)
+        for b in storage.list_builds(pid):
+            if b["status"] != "completed" or (preferred and b["id"] != preferred):
+                continue
+            if build_geometry_key(pid, b["id"]) == key:
+                return b
+        return None
+
+    @app.get("/api/projects/{pid}/versions/{number}/build-options")
+    def build_options(pid: str, number: int) -> dict:
+        """Can this version update a saved model in place (only layers such as sensors changed), or does the
+        building have to be generated again? Shown before the user starts a build."""
+        scene = storage.load_scene(pid, number)
+        meta = storage.get_version_meta(pid, number)
+        base = layer_base(pid, scene)
+        completed = [b for b in storage.list_builds(pid) if b["status"] == "completed"]
+        out: dict[str, Any] = {"version": number, "can_generate": meta["validation"].get("can_generate"),
+                               "saved_builds": len(completed)}
+        brief_b = lambda b: {k: b.get(k) for k in ("id", "version", "kind", "finished_at")}  # noqa: E731
+        if base is not None:
+            old = build_scene(pid, base["id"])
+            ch = layer_changes(old, scene)
+            out["layer"] = {"possible": True, "base_build": brief_b(base), "changes": ch,
+                            "up_to_date": ch["changed"] == 0 and base["version"] == number}
+        else:
+            reason = "No saved model yet: generate the building once with Blender."
+            detail = None
+            if completed:
+                latest = completed[0]
+                old = build_scene(pid, latest["id"])
+                if old is not None:
+                    detail = change_summary(old, scene)
+                    parts = [f"{k} {', '.join(f'{n} {w}' for w, n in v.items() if n)}"
+                             for k, v in detail["counts"].items() if k != "sensors" and any(v.values())]
+                    parts += detail["sections"]
+                    reason = (f"The building changed since the saved build {latest['id']} (v{latest['version']})"
+                              + (f": {'; '.join(parts)}" if parts else "") + ". It has to be generated again.")
+            out["layer"] = {"possible": False, "reason": reason, "changes_vs_latest": detail}
+        return out
+
+    def start_layer_build(pid: str, number: int, scene: Scene, base: dict) -> dict:
+        job = jobs.create(pid, "layer_build", {"mode": "layer", "base_build": base["id"]}, number)
+        bid = storage.create_build(pid, number, job["id"], base["id"], kind="layer")["id"]
+
+        def run(ctx: JobContext) -> tuple[str, dict]:
+            storage.update_build(bid, status="processing")
+            try:
+                man = run_layer_build(scene, storage.build_dir(pid, bid), build_id=bid,
+                                      base_dir=storage.build_dir(pid, base["id"]), base_id=base["id"],
+                                      base_version=base["version"], on_progress=ctx.progress)
+            except Exception:
+                storage.update_build(bid, status="failed")
+                raise
+            summary = {"kind": "layer", "base_build": base["id"], "base_version": base["version"],
+                       "geometry_build": man["geometry_build"], "sensors": len(man["sensors"]),
+                       "changes": man["layers"]["sensors"]["changes"], "timings": man["timings"],
+                       "rooms": len(man["rooms"]), "furniture": len(man["furniture"]), "exports": len(man["exports"]),
+                       "reused": len(man["exports"]), "previews": man["files"]["previews"]}
+            storage.update_build(bid, status="completed", summary=summary)
+            storage.update_project(pid, status="generated")
+            return "completed", {"build_id": bid, **summary}
+
+        jobs.start(job, run)
+        return {**job, "build_id": bid, "build_kind": "layer"}
+
     @app.post("/api/projects/{pid}/versions/{number}/build", status_code=202)
     def build(pid: str, number: int, body: BuildBody) -> dict:
         scene = storage.load_scene(pid, number)
@@ -588,6 +723,13 @@ def create_app(settings: Settings | None = None, ai_transport=None) -> FastAPI:
         if not report.can_generate:
             raise ApiError(409, "SCENE_NOT_READY", "Fix errors and confirm or accept estimated measurements first.",
                            [i.model_dump() for i in report.issues if i.severity in ("error", "review")][:50])
+        if body.mode in ("layer", "auto"):
+            base = layer_base(pid, scene, body.base_build)
+            if base is not None:
+                return start_layer_build(pid, number, scene, base)
+            if body.mode == "layer":
+                opts = build_options(pid, number)
+                raise ApiError(409, "LAYER_UPDATE_NOT_POSSIBLE", opts["layer"]["reason"], opts["layer"])
         prev = storage.latest_completed_build(pid) if body.reuse_previous else None
         job = jobs.create(pid, "build", body.model_dump(), number)
         build_row = storage.create_build(pid, number, job["id"], prev["id"] if prev else None)
@@ -602,8 +744,9 @@ def create_app(settings: Settings | None = None, ai_transport=None) -> FastAPI:
             except Exception:
                 storage.update_build(bid, status="failed")
                 raise
-            summary = {"timings": res.timings, "reused": len(res.reused), "exports": len(res.manifest["exports"]),
-                       "rooms": len(res.manifest["rooms"]), "furniture": len(res.manifest["furniture"]),
+            summary = {"kind": "full", "timings": res.timings, "reused": len(res.reused),
+                       "exports": len(res.manifest["exports"]), "rooms": len(res.manifest["rooms"]),
+                       "furniture": len(res.manifest["furniture"]), "sensors": len(res.manifest["sensors"]),
                        "previews": res.manifest["files"]["previews"]}
             storage.update_build(bid, status="completed", summary=summary)
             storage.update_project(pid, status="generated")
@@ -676,6 +819,14 @@ def create_app(settings: Settings | None = None, ai_transport=None) -> FastAPI:
     # ---- HVAC drawing import, live data, airflow model ----------------------------------------
     from twin.hvac.routes import register as register_hvac
     register_hvac(app, settings, storage, jobs, store_version, ApiError)
+
+    # ---- read-only API of the packaged Unreal viewer (token-protected) -------------------------
+    from twin.viewer.routes import register as register_viewer
+    register_viewer(app, settings, storage)
+
+    # ---- local Pixel Streaming test: the packaged viewer streamed into the web app (off by default) ------
+    from twin.stream.routes import register as register_stream
+    app.state.streamer = register_stream(app, settings, storage, ApiError)
 
     # ---- unreal (registered by twin.unreal.routes when available) ----------------------------
     try:

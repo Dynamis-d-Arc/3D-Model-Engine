@@ -26,6 +26,7 @@ COLLECTIONS = {
     "levels": ("levels",), "rooms": ("rooms",), "walls": ("walls",), "openings": ("openings",),
     "furniture": ("furniture",), "materials": ("materials",),
     "hvac_units": ("hvac", "units"), "hvac_terminals": ("hvac", "terminals"), "ducts": ("hvac", "ducts"),
+    "sensors": ("sensors",),
 }
 MAX_OPERATIONS = 60
 
@@ -33,13 +34,15 @@ SYSTEM_FIX = """\
 You correct a 3D digital-twin scene model when the user tells you what is wrong. The scene is the single
 source of truth: metres, +x east, +y north, +z up, room polygons and walls on wall CENTRELINES, angles in
 degrees counter-clockwise from +x. HVAC units and ducts sit in the ceiling void unless they have an
-elevation; diffusers/grilles sit in the ceiling plane. Furniture rotation 0 = front faces -y.
+elevation; diffusers/grilles sit in the ceiling plane. Furniture rotation 0 = front faces -y. Sensors are
+monitoring points: position = plan location, elevation = centre height above the floor (null = 1.5 m, or just
+under the ceiling when mounting is "ceiling"), unit_id = the HVAC unit they monitor.
 
 Answer ONLY with edit operations:
 - op "update": data_json is a JSON object with ONLY the fields to change (nested objects such as finishes,
   size or certainty are merged one level deep). To move something give its new position / polygon / path.
 - op "add": data_json is the complete new entity including a new unique "id" (follow the id style of the
-  collection, e.g. R66, W78, O38, F36, SD84, RG58, D200, U_1FC-41). Use existing ids for references.
+  collection, e.g. R66, W78, O38, F36, SD84, RG58, D200, U_1FC-41, S12). Use existing ids for references.
 - op "delete": data_json is "". Deleting a wall deletes its openings; deleting a room deletes its furniture;
   deleting a unit unlinks its terminals and ducts.
 Rules: change as little as possible and only what the request needs; keep every other value exactly as it is;
@@ -197,12 +200,12 @@ def _cascade_delete(data: dict, name: str, ident: str) -> None:
         for o in data["openings"]:
             if o.get("opens_into") == ident:
                 o["opens_into"] = None
-        for coll in (data["hvac"]["units"], data["hvac"]["terminals"]):
+        for coll in (data["hvac"]["units"], data["hvac"]["terminals"], data["sensors"]):
             for el in coll:
                 if el.get("room_id") == ident:
                     el["room_id"] = None
     elif name == "hvac_units":
-        for coll in (data["hvac"]["terminals"], data["hvac"]["ducts"]):
+        for coll in (data["hvac"]["terminals"], data["hvac"]["ducts"], data["sensors"]):
             for el in coll:
                 if el.get("unit_id") == ident:
                     el["unit_id"] = None
