@@ -5,6 +5,8 @@
 #include "Dom/JsonObject.h"
 #include "Engine/World.h"
 #include "EngineUtils.h"
+#include "Framework/Application/IInputProcessor.h"
+#include "Framework/Application/SlateApplication.h"
 #include "GameFramework/CharacterMovementComponent.h"
 #include "HAL/FileManager.h"
 #include "HAL/PlatformApplicationMisc.h"
@@ -22,6 +24,26 @@
 #include "TwinMeta.h"
 #include "TwinViewerDirector.h"
 #include "UnrealClient.h"
+
+/**
+ * Streaming mode: Pixel Streaming hands browser mouse movement to Slate as raw mouse moves. Those reach the player
+ * input axes (GetInputMouseDelta) only while the game viewport has captured the mouse, and an off-screen viewport
+ * (-RenderOffscreen) has no window that could capture it. A pre-processor sees every mouse move before routing,
+ * so the controller takes the look deltas from here instead.
+ */
+class FTwinMouseDeltaProcessor : public IInputProcessor
+{
+public:
+	FVector2D Accumulated = FVector2D::ZeroVector;
+
+	virtual void Tick(const float DeltaTime, FSlateApplication& SlateApp, TSharedRef<ICursor> Cursor) override {}
+	virtual bool HandleMouseMoveEvent(FSlateApplication& SlateApp, const FPointerEvent& MouseEvent) override
+	{
+		Accumulated += MouseEvent.GetCursorDelta();
+		return false;  // never consume: the menus still need the cursor
+	}
+	virtual const TCHAR* GetDebugName() const override { return TEXT("TwinMouseDelta"); }
+};
 
 namespace
 {
@@ -46,6 +68,25 @@ void ATwinPlayerController::BeginPlay()
 	RefreshTwinActors();
 	SetInputMode(FInputModeGameOnly());
 	bShowMouseCursor = false;
+	// Pixel Streaming: this viewer runs on a server and is shown in a browser (see the class comment)
+	const TCHAR* Cmd = FCommandLine::Get();
+	FString StreamUrl;
+	bStreaming = FParse::Param(Cmd, TEXT("TwinStreaming")) || FParse::Value(Cmd, TEXT("PixelStreamingConnectionURL="), StreamUrl);
+	if (bStreaming)
+	{
+		IdleExitSeconds = 600.f;
+		MaxSessionSeconds = 3600.f;
+		FParse::Value(Cmd, TEXT("TwinIdleExit="), IdleExitSeconds);
+		FParse::Value(Cmd, TEXT("TwinMaxSession="), MaxSessionSeconds);
+		if (FSlateApplication::IsInitialized())
+		{
+			MouseProcessor = MakeShared<FTwinMouseDeltaProcessor>();
+			const bool bOk = FSlateApplication::Get().RegisterInputPreProcessor(MouseProcessor);
+			UE_LOG(LogTemp, Log, TEXT("Twin: mouse look pre-processor %s"), bOk ? TEXT("registered") : TEXT("NOT registered"));
+		}
+		UE_LOG(LogTemp, Log, TEXT("Twin: streaming mode (idle exit %.0f s, max session %.0f s)"), IdleExitSeconds, MaxSessionSeconds);
+	}
+	LastInputAt = SessionStartedAt = FPlatformTime::Seconds();
 	bTour = FParse::Param(FCommandLine::Get(), TEXT("TwinTour"));
 	if (bTour)
 	{
@@ -183,9 +224,104 @@ FString ATwinPlayerController::ModeName() const
 	return C->IsFlying() ? TEXT("Fly") : TEXT("Walk");
 }
 
+void ATwinPlayerController::EndPlay(const EEndPlayReason::Type Reason)
+{
+	if (MouseProcessor.IsValid() && FSlateApplication::IsInitialized())
+	{
+		FSlateApplication::Get().UnregisterInputPreProcessor(MouseProcessor);
+	}
+	MouseProcessor.Reset();
+	Super::EndPlay(Reason);
+}
+
+void ATwinPlayerController::ApplyLook(float YawDeg, float PitchDeg)
+{
+	// Straight onto the control rotation. AddYawInput / AddPitchInput would be lost: the engine applies the pending
+	// rotation input inside Super::PlayerTick and clears it when PlayerTick returns, and our input runs after Super.
+	if (FMath::IsNearlyZero(YawDeg) && FMath::IsNearlyZero(PitchDeg))
+	{
+		return;
+	}
+	FRotator R = GetControlRotation();
+	R.Yaw = FRotator::NormalizeAxis(R.Yaw + YawDeg);
+	R.Pitch = FMath::ClampAngle(FRotator::NormalizeAxis(R.Pitch) + PitchDeg, -85.f, 85.f);
+	R.Roll = 0.f;
+	SetControlRotation(R);
+}
+
+void ATwinPlayerController::LookDelta(float& MX, float& MY) const
+{
+	if (MouseProcessor.IsValid())
+	{
+		MX = FrameMouse.X;
+		MY = -FrameMouse.Y;  // Slate: +Y = down the screen; input axes: +Y = up
+		return;
+	}
+	GetInputMouseDelta(MX, MY);
+}
+
+double ATwinPlayerController::IdleSecondsLeft() const
+{
+	return (bStreaming && IdleExitSeconds > 0.f) ? IdleExitSeconds - (FPlatformTime::Seconds() - LastInputAt) : -1.0;
+}
+
+void ATwinPlayerController::TickStreamingSession()
+{
+	// a streamed session must end by itself: nobody is at the server to close it
+	const double Now = FPlatformTime::Seconds();
+	if (MouseProcessor.IsValid())   // this frame's mouse movement, taken once so menus do not pile it up
+	{
+		FrameMouse = MouseProcessor->Accumulated;
+		MouseProcessor->Accumulated = FVector2D::ZeroVector;
+	}
+	float MX = 0.f, MY = 0.f;
+	LookDelta(MX, MY);
+	if (!FMath::IsNearlyZero(MX) || !FMath::IsNearlyZero(MY) || IsInputKeyDown(EKeys::AnyKey) ||
+		WasInputKeyJustPressed(EKeys::AnyKey))
+	{
+		LastInputAt = Now;
+	}
+	const ATwinViewerDirector* D = Director.Get();
+	if (D && D->State == ETwinLoadState::Error)
+	{
+		ErrorSince = ErrorSince > 0.0 ? ErrorSince : Now;
+	}
+	else
+	{
+		ErrorSince = 0.0;
+	}
+	int32 Code = 0;
+	const TCHAR* Why = TEXT("");
+	if (IdleExitSeconds > 0.f && Now - LastInputAt > IdleExitSeconds)
+	{
+		Code = 4;
+		Why = TEXT("no input");
+	}
+	else if (MaxSessionSeconds > 0.f && Now - SessionStartedAt > MaxSessionSeconds)
+	{
+		Code = 5;
+		Why = TEXT("maximum session length");
+	}
+	else if (ErrorSince > 0.0 && Now - ErrorSince > 60.0)
+	{
+		Code = 3;
+		Why = TEXT("the building could not be loaded");
+	}
+	if (Code != 0 && !bExitRequested)
+	{
+		bExitRequested = true;
+		UE_LOG(LogTemp, Log, TEXT("Twin: ending the streaming session (%s), exit code %d"), Why, Code);
+		FPlatformMisc::RequestExitWithStatus(false, (uint8)Code);
+	}
+}
+
 void ATwinPlayerController::PlayerTick(float DeltaTime)
 {
 	Super::PlayerTick(DeltaTime);
+	if (bStreaming)
+	{
+		TickStreamingSession();
+	}
 	ATwinViewerDirector* D = Director.Get();
 	if (D && !D->IsReady())
 	{
@@ -327,7 +463,7 @@ void ATwinPlayerController::HandleInput(float DeltaTime)
 	const bool bCtrl = IsInputKeyDown(EKeys::LeftControl) || IsInputKeyDown(EKeys::RightControl);
 	if (D)
 	{
-		if (bCtrl && WasInputKeyJustPressed(EKeys::V))
+		if (!bStreaming && bCtrl && WasInputKeyJustPressed(EKeys::V))   // a streamed viewer has no clipboard of the user
 		{
 			PasteLaunch();
 			return;
@@ -343,7 +479,7 @@ void ATwinPlayerController::HandleInput(float DeltaTime)
 		}
 		if (!D->IsReady())
 		{
-			if (WasInputKeyJustPressed(EKeys::Escape))
+			if (!bStreaming && WasInputKeyJustPressed(EKeys::Escape))
 			{
 				FPlatformMisc::RequestExit(false);  // works in Shipping too (no console commands there)
 			}
@@ -364,6 +500,12 @@ void ATwinPlayerController::HandleInput(float DeltaTime)
 				}
 				Notify(D->IsAirflowVisible() ? TEXT("Airflow illustration on (schematic, not measured)") : TEXT("Airflow illustration off"));
 			}
+		}
+		if (WasInputKeyJustPressed(EKeys::T) && D->IsAirflowVisible())
+		{
+			ATwinAirflowActor* A = D->AirflowActor;
+			A->SetMistShown(!A->IsMistShown());
+			Notify(A->IsMistShown() ? TEXT("Temperature mist on") : TEXT("Temperature mist off (tracers only)"));
 		}
 	}
 	ATwinCharacter* C = TwinPawn();
@@ -400,11 +542,10 @@ void ATwinPlayerController::HandleInput(float DeltaTime)
 	C->AddMovementInput(FRotationMatrix(Yaw).GetUnitAxis(EAxis::Y), Right);
 
 	float MX = 0.f, MY = 0.f;
-	GetInputMouseDelta(MX, MY);
+	LookDelta(MX, MY);
 	const float KeyYaw = (IsInputKeyDown(EKeys::Right) ? 1.f : 0.f) - (IsInputKeyDown(EKeys::Left) ? 1.f : 0.f);
 	const float KeyPitch = (IsInputKeyDown(EKeys::Up) ? 1.f : 0.f) - (IsInputKeyDown(EKeys::Down) ? 1.f : 0.f);
-	AddYawInput(MX * 0.25f + KeyYaw * 90.f * DeltaTime);
-	AddPitchInput(-MY * 0.25f - KeyPitch * 60.f * DeltaTime);
+	ApplyLook(MX * LookDegPerCount + KeyYaw * 90.f * DeltaTime, MY * LookDegPerCount + KeyPitch * 60.f * DeltaTime);
 
 	if (WasInputKeyJustPressed(EKeys::F))
 	{
@@ -447,11 +588,11 @@ void ATwinPlayerController::HandleInput(float DeltaTime)
 	{
 		WalkToCrosshair();
 	}
-	if (WasInputKeyJustPressed(EKeys::P))
+	if (!bStreaming && WasInputKeyJustPressed(EKeys::P))   // streamed: the file would land on the server
 	{
 		TakeScreenshot();
 	}
-	if (WasInputKeyJustPressed(EKeys::Escape))
+	if (!bStreaming && WasInputKeyJustPressed(EKeys::Escape))   // streamed: Esc frees the mouse in the browser
 	{
 		FPlatformMisc::RequestExit(false);  // works in Shipping too (no console commands there)
 	}
@@ -894,6 +1035,27 @@ void ATwinPlayerController::StartTour()
 		return 0.2f;
 	});
 
+	// 4b) look: the same turn the mouse / arrow keys make must still be there a few frames later
+	TourSteps.Add([this]() -> float
+	{
+		SetControlRotation(FRotator(0.f, 180.f, 0.f));
+		LookStart = GetControlRotation();
+		ApplyLook(30.f, 10.f);
+		return 0.3f;
+	});
+	TourSteps.Add([this]() -> float
+	{
+		const FRotator Now = GetControlRotation();
+		const float Yaw = FRotator::NormalizeAxis(Now.Yaw - LookStart.Yaw);
+		const float Pitch = FRotator::NormalizeAxis(Now.Pitch - LookStart.Pitch);
+		TSharedPtr<FJsonObject> Look = MakeShared<FJsonObject>();
+		Look->SetNumberField(TEXT("yaw_turned_deg"), Yaw);
+		Look->SetNumberField(TEXT("pitch_turned_deg"), Pitch);
+		Look->SetBoolField(TEXT("ok"), FMath::IsNearlyEqual(Yaw, 30.f, 0.5f) && FMath::IsNearlyEqual(Pitch, 10.f, 0.5f));
+		TourReport->SetObjectField(TEXT("look"), Look);
+		return 0.2f;
+	});
+
 	// 5) one eye-level screenshot per room (from a corner, looking across the room); -TwinTourRooms=N limits them
 	int32 ShotRooms = RoomFloors.Num();
 	FParse::Value(FCommandLine::Get(), TEXT("TwinTourRooms="), ShotRooms);
@@ -1250,6 +1412,22 @@ void ATwinPlayerController::AddViewerSteps()
 			A->SetNumberField(TEXT("dots"), D->AirflowActor->NumDots());
 			A->SetNumberField(TEXT("dots_moving"), D->AirflowActor->VisibleDots());
 			A->SetNumberField(TEXT("units"), D->AirflowActor->NumUnits());
+			ATwinAirflowActor* Af = D->AirflowActor;
+			TSharedPtr<FJsonObject> M = MakeShared<FJsonObject>();
+			M->SetBoolField(TEXT("material"), Af->HasMistMaterial());
+			M->SetBoolField(TEXT("params_ok"), Af->MistParamsOk());
+			M->SetNumberField(TEXT("zones"), Af->NumMistZones());
+			M->SetNumberField(TEXT("visible"), Af->VisibleMistZones());
+			M->SetStringField(TEXT("driver"), Af->Driver());
+			M->SetNumberField(TEXT("mask_w"), Af->MaskSize().X);
+			M->SetNumberField(TEXT("mask_h"), Af->MaskSize().Y);
+			const FVector2D Range = Af->TemperatureRange();
+			if (!FMath::IsNaN(Range.X))
+			{
+				M->SetNumberField(TEXT("temp_min_c"), Range.X);
+				M->SetNumberField(TEXT("temp_max_c"), Range.Y);
+			}
+			A->SetObjectField(TEXT("mist"), M);
 		}
 		A->SetStringField(TEXT("error"), D ? D->AirflowError : FString());
 		if (D && D->Airflow.IsValid())
@@ -1266,6 +1444,53 @@ void ATwinPlayerController::AddViewerSteps()
 		Shot(TEXT("airflow"));
 		return 0.8f;
 	});
+	// the same unit from above and to the side, ceilings hidden (the web Live tab's view)
+	TourSteps.Add([this]() -> float
+	{
+		if (!TourHvac.IsValid())
+		{
+			return 0.1f;
+		}
+		if (ATwinCharacter* C = TwinPawn())
+		{
+			C->SetGhost(true);
+		}
+		SetCeilingsVisible(false);
+		FBox B = TourHvac->GetComponentsBoundingBox(true).ExpandBy(400.f);
+		for (const auto& F : RoomFloors)
+		{
+			if (F.IsValid() && TwinMeta::Get(F.Get(), TEXT("Room")) == TwinMeta::Get(TourHvac.Get(), TEXT("Room")))
+			{
+				B = F->GetComponentsBoundingBox(true);
+			}
+		}
+		const FVector C(B.GetCenter().X, B.GetCenter().Y, 100.f);
+		const float Span = FMath::Max(B.GetSize().X, B.GetSize().Y);
+		PlaceCamera(C + FVector(-0.5f * Span, 0.4f * Span, 0.45f * Span + 300.f), C);
+		return 2.0f;
+	});
+	TourSteps.Add([this]() -> float { Shot(TEXT("airflow_above")); return 0.8f; });
+	// the whole floor from above with the mist on
+	TourSteps.Add([this]() -> float
+	{
+		FBox All(ForceInit);
+		for (const auto& F : RoomFloors)
+		{
+			if (F.IsValid())
+			{
+				All += F->GetComponentsBoundingBox(true);
+			}
+		}
+		if (!All.IsValid)
+		{
+			return 0.1f;
+		}
+		const FVector Center = All.GetCenter();
+		const float Span = FMath::Max(All.GetSize().X, All.GetSize().Y);
+		PlaceCamera(Center + FVector(-0.45f * Span, 0.75f * Span, 0.95f * Span), Center);
+		return 2.0f;
+	});
+	TourSteps.Add([this]() -> float { Shot(TEXT("airflow_overview")); return 0.8f; });
 	TourSteps.Add([this]() -> float
 	{
 		if (ATwinViewerDirector* D = Director.Get())

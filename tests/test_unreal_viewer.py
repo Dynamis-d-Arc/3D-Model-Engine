@@ -91,6 +91,7 @@ def test_packaged_viewer_walkthrough(tour):
     assert nav["valid"] is True and all(x["reachable"] for x in nav["reachability"][1:]), nav
     assert r["walk"]["arrived"] is True, r["walk"]
     assert r["wall_collision"]["stayed_inside_room"] is True, r["wall_collision"]
+    assert r["look"]["ok"] is True, r["look"]   # mouse / arrow-key look turns the view and the turn sticks
     assert r["selection"]["selected"] is True and r["selection"]["kind"] == "furniture"
     for shot in r["screenshots"]:
         assert (out / shot).stat().st_size > 10_000, shot
@@ -111,6 +112,14 @@ def test_packaged_viewer_hvac_identity_and_live_data(tour):
         assert sel["on"] is False
     a = r["airflow"]
     assert a["kind"] == "illustration" and "not a CFD result" in a["disclaimer"] and a["dots"] > 0 and a["units"] == 2
+    # the mist (the web Live tab's temperature cloud): one zone per unit, driven by the feed; SPLIT-1 is off, so
+    # neither its mist nor its tracers are drawn; FCU-1 takes its own return-air temperature
+    mist = a["mist"]
+    assert mist["material"] is True and mist["params_ok"] is True and mist["zones"] == 2 and mist["driver"] == "feed", mist
+    assert mist["visible"] == 1, mist
+    assert mist["temp_min_c"] == pytest.approx(24.2, abs=0.01) and mist["temp_max_c"] == pytest.approx(24.2, abs=0.01)
+    assert mist["mask_w"] > 2 and mist["mask_h"] > 2
+    assert a["dots_moving"] * 2 == a["dots"], a
 
 
 def test_packaged_viewer_switches_buildings(served, tour):

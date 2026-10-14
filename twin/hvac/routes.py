@@ -20,8 +20,9 @@ from twin.config import PROJECT_ROOT, Settings
 from twin.hvac.airflow import DOMAIN_VERSION, build_domain, focus_rooms
 from twin.hvac.illustration import ThermalResultsError, airflow_zones, validate_thermal_results
 from twin.hvac.importer import HvacImportError, render_overlay
-from twin.hvac.telemetry import TelemetryBody, TelemetryStore, simulate
+from twin.hvac.telemetry import TelemetryBody, TelemetryStore, simulate, simulate_sensors
 from twin.scene.model import Scene
+from twin.scene.sensors import relink_sensor_units
 
 
 class HvacImportBody(BaseModel):
@@ -112,8 +113,9 @@ def register(app: FastAPI, settings: Settings, storage: Storage, jobs: JobManage
                     "file_name": meta["original_name"], "manual": body.manual, "plan": plan}
             (out_dir / "spec.json").write_text(json.dumps(spec), encoding="utf-8")
             res = run_import_process(out_dir / "spec.json", ctx)
-            updated = scene.model_copy(update={"hvac": res["hvac"]})
-            updated = Scene.model_validate(updated.model_dump(mode="json"))
+            data = {**scene.model_dump(mode="json"), "hvac": res["hvac"]}
+            relink_sensor_units(data, scene)   # sensors follow their unit by tag into the re-imported layer
+            updated = Scene.model_validate(data)
             (out_dir / "report.json").write_text(json.dumps(res["report"], indent=1), encoding="utf-8")
             (out_dir / "scene_in.json").unlink(missing_ok=True)
             if plan_meta:
@@ -240,18 +242,53 @@ def register(app: FastAPI, settings: Settings, storage: Storage, jobs: JobManage
             f.unlink()
         return {"deleted": True}
 
+    sensor_cache: dict[tuple[str, int], list[dict]] = {}
+
+    def sensors_for(pid: str, version: int) -> list[dict]:
+        """What the sensor simulation needs per sensor of a version (versions are immutable: cached)."""
+        key = (pid, version)
+        if key not in sensor_cache:
+            from twin.scene import geometry as g
+            from twin.scene.sensors import KIND_UNITS, sensor_placement
+            scene = storage.load_scene(pid, version)
+            place = sensor_placement(scene)
+            rooms = {r.id: r for r in scene.rooms}
+            sensor_cache[key] = [{"id": s.id, "tag": s.tag, "kind": s.kind, "unit_id": s.unit_id, "bms_point": s.bms_point,
+                                  "unit": KIND_UNITS[s.kind], "room_id": place[s.id]["room_id"],
+                                  "height_m": round(place[s.id]["centre"] - place[s.id]["floor"], 3),
+                                  "area_m2": round(g.room_polygon(rooms[place[s.id]["room_id"]]).area, 1)
+                                  if place[s.id]["room_id"] else None} for s in scene.sensors]
+        return sensor_cache[key]
+
+    def sensor_readings(pid: str, version: int, units: dict, site: dict, simulated: bool) -> dict:
+        info = sensors_for(pid, version)
+        if not info:
+            return {}
+        sim = simulate_sensors(info, units, site)
+        real = {} if simulated else telemetry.live_sensors(pid)
+        out = {}
+        for s in info:
+            r = real.get(s["id"])
+            v = {**r, "source": "live"} if r else ({**sim[s["id"]], "source": "simulated"} if s["id"] in sim else None)
+            if v is not None:
+                out[s["id"]] = {**v, "tag": s["tag"], "kind": s["kind"], "unit": s["unit"], "room_id": s["room_id"]}
+        return out
+
     @app.get("/api/projects/{pid}/hvac/live")
     def hvac_live(pid: str, version: int, simulated: bool = False) -> dict:
-        """Latest HVAC readings: real data when it is fresh (and not overridden), else the simulated BMS."""
+        """Latest HVAC readings: real data when it is fresh (and not overridden), else the simulated BMS. Sensors of
+        the version's sensor layer come with their own reading (live per sensor when pushed, else simulated)."""
         d = domain_for(pid, version)
         live = None if simulated else telemetry.live(pid)
         if live is not None:
             units, site, newest = live
             known = {u["id"] for u in d["units"]}
-            return {"source": "live", "ts": newest, "site": site or {},
-                    "units": {k: v for k, v in units.items() if k in known}}
+            units = {k: v for k, v in units.items() if k in known}
+            return {"source": "live", "ts": newest, "site": site or {}, "units": units,
+                    "sensors": sensor_readings(pid, version, units, site or {}, simulated)}
         units, site = simulate(d)
-        return {"source": "simulated", "ts": site["ts"], "site": site, "units": units}
+        return {"source": "simulated", "ts": site["ts"], "site": site, "units": units,
+                "sensors": sensor_readings(pid, version, units, site, simulated)}
 
     @app.post("/api/projects/{pid}/hvac/telemetry")
     def hvac_ingest(pid: str, body: TelemetryBody, x_twin_token: str | None = Header(default=None)) -> dict:
@@ -261,14 +298,22 @@ def register(app: FastAPI, settings: Settings, storage: Storage, jobs: JobManage
             raise api_error(401, "BAD_TOKEN", "missing or wrong X-Twin-Token header")
         versions = storage.list_versions(pid)
         tags: dict[str, str] = {}
-        for v in versions:  # newest first: map tags of the newest version that has HVAC
+        sensor_keys: dict[str, str] = {}
+        for v in versions:  # newest first: map tags of the newest version that has HVAC (and sensors)
             sc = storage.load_scene(pid, v["number"])
-            if sc.hvac.units:
+            if sc.sensors and not sensor_keys:
+                for s in sc.sensors:
+                    for k in (s.id, s.tag, s.bms_point):
+                        if k:
+                            sensor_keys.setdefault(k.strip().upper(), s.id)
+            if sc.hvac.units and not tags:
                 tags = {u.tag.upper(): u.id for u in sc.hvac.units} | {u.id.upper(): u.id for u in sc.hvac.units}
+            if tags and (sensor_keys or not body.sensors):
                 break
-        if not tags:
-            raise api_error(409, "HVAC_MISSING", "No version of this project has HVAC units yet.")
-        return telemetry.ingest(pid, body, lambda name: tags.get(name.strip().upper()))
+        if not tags and not sensor_keys:
+            raise api_error(409, "HVAC_MISSING", "No version of this project has HVAC units or sensors yet.")
+        return telemetry.ingest(pid, body, lambda name: tags.get(name.strip().upper()),
+                                lambda name: sensor_keys.get(name.strip().upper()))
 
     @app.get("/api/projects/{pid}/hvac/history")
     def hvac_history(pid: str, limit: int = 120) -> list[dict]:

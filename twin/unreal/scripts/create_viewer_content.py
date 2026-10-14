@@ -5,7 +5,10 @@
 Creates (replacing older versions):
     /Game/Viewer/Materials/M_TwinSurface   opaque, two-sided PBR: BaseColor, BaseColorTex x UseTex, Metallic, Roughness, Emissive
     /Game/Viewer/Materials/M_TwinGlass     translucent, two-sided: BaseColor, Opacity, Roughness
-    /Game/Viewer/Materials/M_TwinFlow      unlit, instanced: colour from PerInstanceCustomData[0..2] x Glow (airflow dots)
+    /Game/Viewer/Materials/M_TwinFlow      unlit, translucent, instanced: colour from PerInstanceCustomData[0..2] x Glow
+                                           (airflow tracer dots)
+    /Game/Viewer/Materials/M_TwinMist      unlit, translucent, two-sided, no depth test: the airflow mist raymarched
+                                           per unit zone box (params Lo/Hi/O0-3/D0-3/Th/Look, Mask texture + MaskRect)
     /Game/Viewer/L_Viewer                  empty level: sun, sky light, atmosphere, fog, post process, a movable
                                            1 m NavMeshBoundsVolume (moved over each building at runtime), TwinGameMode
 
@@ -97,15 +100,31 @@ def glass(report):
     finish(mat, report)
 
 
+def exposure_free(mat, src, x, y, report):
+    """src x 1/exposure: the colour on screen no longer follows the eye adaptation (dots and mist keep their
+    colours in bright and dark rooms). Falls back to src when the node is unavailable."""
+    try:
+        eai = MEL.create_material_expression(mat, unreal.MaterialExpressionEyeAdaptationInverse, x, y)
+        for pin in ("LightValue", "Light Value", "LightValueInput"):
+            if MEL.connect_material_expressions(src, "", eai, pin):
+                return eai
+        report["warnings"].append("EyeAdaptationInverse: no LightValue pin")
+    except Exception as exc:  # noqa: BLE001 - optional nicety
+        report["warnings"].append(f"EyeAdaptationInverse: {exc}")
+    return src
+
+
 def flow(report):
+    """Tracer dots: small, pale, drawn over the mist (translucent, higher sort priority set by the actor)."""
     mat = fresh_material("M_TwinFlow")
     mat.set_editor_property("shading_model", unreal.MaterialShadingModel.MSM_UNLIT)
+    mat.set_editor_property("blend_mode", unreal.BlendMode.BLEND_TRANSLUCENT)
     mat.set_editor_property("used_with_instanced_static_meshes", True)
     chans = []
     for i in range(3):
         c = MEL.create_material_expression(mat, unreal.MaterialExpressionPerInstanceCustomData, -900, -200 + i * 150)
         c.set_editor_property("data_index", i)
-        c.set_editor_property("const_default_value", 0.75)
+        c.set_editor_property("const_default_value", 0.9)
         chans.append(c)
     rg = MEL.create_material_expression(mat, unreal.MaterialExpressionAppendVector, -650, -150)
     MEL.connect_material_expressions(chans[0], "", rg, "A")
@@ -115,8 +134,146 @@ def flow(report):
     MEL.connect_material_expressions(chans[2], "", rgb, "B")
     mul = MEL.create_material_expression(mat, unreal.MaterialExpressionMultiply, -250, -100)
     MEL.connect_material_expressions(rgb, "", mul, "A")
-    MEL.connect_material_expressions(scalar(mat, "Glow", 2.5, -450, 100), "", mul, "B")
-    MEL.connect_material_property(mul, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR)
+    MEL.connect_material_expressions(scalar(mat, "Glow", 1.0, -450, 100), "", mul, "B")
+    MEL.connect_material_property(exposure_free(mat, mul, -100, -100, report), "", unreal.MaterialProperty.MP_EMISSIVE_COLOR)
+    MEL.connect_material_property(scalar(mat, "Opacity", 0.9, -250, 150), "", unreal.MaterialProperty.MP_OPACITY)
+    finish(mat, report)
+
+
+# The web Live tab's cloud (frontend/js/airflow/illustration.js CLOUD_FS) in Unreal axes (X, Y, Z up) and metres.
+# The box mesh sits at the world origin, so local space = world space; it is two-sided and only its back faces
+# (the box exit) draw; the march stops at the opaque scene (walls, furniture) and outside the floor outline.
+MIST_HLSL = r"""
+float3 ro = CamL / 100.0;
+float3 rel = PixL / 100.0 - ro;
+float pd = length(rel);
+float3 rd = rel / max(pd, 1e-4) + 1e-6;
+float3 lo = Lo.xyz / 100.0;
+float3 hi = Hi.xyz / 100.0;
+float3 ta = (lo - ro) / rd;
+float3 tb = (hi - ro) / rd;
+float3 tn = min(ta, tb);
+float3 tf = max(ta, tb);
+float t0 = max(0.0, max(tn.x, max(tn.y, tn.z)));
+float t1 = min(tf.x, min(tf.y, tf.z));
+if (pd < t1 - 0.02) return float4(0, 0, 0, 0);
+t1 = min(t1, pd * SceneZ / max(PixZ, 0.001));
+if (t1 <= t0) return float4(0, 0, 0, 0);
+float ds = (t1 - t0) / 16.0;
+int n = (int)(Th.w + 0.5);
+float3 Os[4] = { O0.xyz / 100.0, O1.xyz / 100.0, O2.xyz / 100.0, O3.xyz / 100.0 };
+float3 Ds[4] = { D0.xyz, D1.xyz, D2.xyz, D3.xyz };
+float4 sum = float4(0, 0, 0, 0);
+for (int j = 0; j < 16; j++)
+{
+    float3 p = ro + rd * (t0 + (j + 0.5) * ds);
+    float2 uv = (p.xy * 100.0 - MaskRect.xy) * MaskRect.zw;
+    if (Mask.SampleLevel(MaskSampler, uv, 0).r < 0.5) continue;
+    float jet = 0.0;
+    [unroll] for (int i = 0; i < 4; i++)
+    {
+        if (i < n)
+        {
+            float3 v = p - Os[i];
+            float3 dir = Ds[i];
+            float d = dot(v, dir);
+            float len = min(8.5, (abs(dir.x) > 0.5 ? hi.x - lo.x : hi.y - lo.y) * 0.82);
+            float h = Os[i].z - 2.1 * smoothstep(0.0, len, d);
+            float lat = dot(v.xy, float2(dir.y, -dir.x));
+            float w = max(0.2 + d * 0.2, 0.05);
+            float b = exp(-(lat * lat + (p.z - h) * (p.z - h)) / (w * w));
+            jet = max(jet, b * smoothstep(-0.1, 0.25, d) * (1.0 - smoothstep(len * 0.8, len * 1.25, d)));
+        }
+    }
+    jet *= Look.x;
+    float temp = lerp(Th.x, Th.y, saturate((p.y - lo.y) / (hi.y - lo.y))) + 0.13 * (p.z - lo.z - 1.5) - Th.z * jet;
+    float u = saturate((temp - 12.0) / 24.0);
+    float3 c;
+    if (u < 0.2) c = lerp(float3(0.28, 0.16, 0.55), float3(0.04, 0.65, 0.95), u / 0.2);
+    else if (u < 0.42) c = lerp(float3(0.04, 0.65, 0.95), float3(0.13, 0.94, 0.64), (u - 0.2) / 0.22);
+    else if (u < 0.64) c = lerp(float3(0.13, 0.94, 0.64), float3(0.85, 0.93, 0.28), (u - 0.42) / 0.22);
+    else if (u < 0.82) c = lerp(float3(0.85, 0.93, 0.28), float3(1.0, 0.56, 0.23), (u - 0.64) / 0.18);
+    else c = lerp(float3(1.0, 0.56, 0.23), float3(0.94, 0.2, 0.19), (u - 0.82) / 0.18);
+    float ripple = 0.83 + 0.17 * sin(p.x * 2.1 + p.y * 1.6 + p.z * 3.0 - Secs * 2.2);
+    float2 edge = min(p.xy - lo.xy, hi.xy - p.xy);
+    float feather = smoothstep(0.0, 0.7, min(edge.x, edge.y));
+    float a = 1.0 - exp(-(0.035 + 0.38 * jet) * ripple * feather * Look.y * ds);
+    sum.rgb += (1.0 - sum.a) * c * a;
+    sum.a += (1.0 - sum.a) * a;
+}
+if (sum.a < 0.001) return float4(0, 0, 0, 0);
+return float4(pow(sum.rgb / sum.a, 2.2) * Look.z, min(0.8, sum.a));
+"""
+
+
+def mist(report):
+    """Airflow mist: translucent, unlit, two-sided, no depth test (the shader stops at the scene depth itself)."""
+    mat = fresh_material("M_TwinMist")
+    mat.set_editor_property("shading_model", unreal.MaterialShadingModel.MSM_UNLIT)
+    mat.set_editor_property("blend_mode", unreal.BlendMode.BLEND_TRANSLUCENT)
+    mat.set_editor_property("two_sided", True)
+    mat.set_editor_property("disable_depth_test", True)
+    custom = MEL.create_material_expression(mat, unreal.MaterialExpressionCustom, -500, 0)
+    custom.set_editor_property("code", MIST_HLSL.strip())
+    custom.set_editor_property("description", "Airflow mist (illustration, not CFD)")
+    custom.set_editor_property("output_type", unreal.CustomMaterialOutputType.CMOT_FLOAT4)
+    pins = ["PixL", "CamL", "SceneZ", "PixZ", "Secs", "Lo", "Hi", "O0", "O1", "O2", "O3", "D0", "D1", "D2", "D3",
+            "Th", "Look", "Mask", "MaskRect"]
+    inputs = []
+    for name in pins:
+        ci = unreal.CustomInput()
+        ci.set_editor_property("input_name", name)
+        inputs.append(ci)
+    custom.set_editor_property("inputs", inputs)
+
+    y = -1400
+    def node(cls, **props):
+        nonlocal y
+        e = MEL.create_material_expression(mat, cls, -1000, y)
+        y += 120
+        for k, v in props.items():
+            e.set_editor_property(k, v)
+        return e
+
+    sources = {
+        "PixL": node(unreal.MaterialExpressionLocalPosition),
+        "CamL": None,
+        "SceneZ": node(unreal.MaterialExpressionSceneDepth),
+        "PixZ": node(unreal.MaterialExpressionPixelDepth),
+        "Secs": node(unreal.MaterialExpressionTime),
+    }
+    cam = node(unreal.MaterialExpressionCameraPositionWS)
+    to_local = node(unreal.MaterialExpressionTransformPosition,
+                    transform_source_type=unreal.MaterialPositionTransformSource.TRANSFORMPOSSOURCE_WORLD,
+                    transform_type=unreal.MaterialPositionTransformSource.TRANSFORMPOSSOURCE_LOCAL)
+    if not MEL.connect_material_expressions(cam, "", to_local, ""):
+        raise RuntimeError("mist: camera -> local transform did not connect")
+    sources["CamL"] = to_local
+    defaults = {"Lo": (0, 0, 0, 0), "Hi": (100, 100, 280, 0), "Th": (27, 27, 0, 0), "Look": (1, 1, 1.15, 0),
+                "MaskRect": (0, 0, 0, 0)}
+    for name in ("Lo", "Hi", "O0", "O1", "O2", "O3", "D0", "D1", "D2", "D3", "Th", "Look", "MaskRect"):
+        p = vector(mat, name, defaults.get(name, (0, 0, 0, 0)), -1000, y)
+        y += 120
+        sources[name] = p
+    tex = MEL.create_material_expression(mat, unreal.MaterialExpressionTextureObjectParameter, -1000, y)
+    tex.set_editor_property("parameter_name", "Mask")
+    tex.set_editor_property("texture", unreal.load_asset("/Engine/EngineResources/WhiteSquareTexture"))
+    sources["Mask"] = tex
+    for name in pins:
+        # a vector parameter's default pin is RGB (float3); Th and MaskRect use their 4th component
+        out = "RGBA" if isinstance(sources[name], unreal.MaterialExpressionVectorParameter) else ""
+        if not MEL.connect_material_expressions(sources[name], out, custom, name):
+            raise RuntimeError(f"mist: input {name} did not connect")
+    rgb = MEL.create_material_expression(mat, unreal.MaterialExpressionComponentMask, -250, -60)
+    for ch, on in (("r", True), ("g", True), ("b", True), ("a", False)):
+        rgb.set_editor_property(ch, on)
+    MEL.connect_material_expressions(custom, "", rgb, "")
+    alpha = MEL.create_material_expression(mat, unreal.MaterialExpressionComponentMask, -250, 80)
+    for ch, on in (("r", False), ("g", False), ("b", False), ("a", True)):
+        alpha.set_editor_property(ch, on)
+    MEL.connect_material_expressions(custom, "", alpha, "")
+    MEL.connect_material_property(exposure_free(mat, rgb, -100, -60, report), "", unreal.MaterialProperty.MP_EMISSIVE_COLOR)
+    MEL.connect_material_property(alpha, "", unreal.MaterialProperty.MP_OPACITY)
     finish(mat, report)
 
 
@@ -181,6 +338,7 @@ def main():
         surface(report)
         glass(report)
         flow(report)
+        mist(report)
         level(report)
         EAL.save_directory(ROOT, only_if_is_dirty=True, recursive=True)
         report["status"] = "ok"

@@ -106,11 +106,22 @@ kept. The same numbers are checked twice:
 * Click any object: furniture (asset, size, room) or HVAC equipment: tag, unit, design airflow and the
   latest reading — labelled **LIVE BMS (measured)** or **SIMULATED BMS – demonstration, not measured**,
   with its age; a broken feed keeps the last reading and says so.
-* **V** airflow illustration: tracer dots from each unit's supply diffusers (or casing outlet) along the
-  ceiling, into the room and back to its return grille; colour = the unit's supply → return air
-  temperature from the telemetry feed; units that are off show nothing. While it is visible a banner says
-  **"AIRFLOW ILLUSTRATION – schematic, not measured, not a CFD result"**, names the temperature source
-  and shows the MATLAB thermal model's west/east zone temperatures as *simulation*.
+* **V** airflow illustration, the same design as the web **Live** tab (ported from its
+  `frontend/js/airflow/illustration.js`, `school-flow.js`, `thermal.js`):
+  * **mist** — per unit a box (±3 m, floor to ceiling) raymarched by `M_TwinMist` in 16 steps: the zone's air
+    temperature + 0.13 °C/m above 1.5 m − drop × jet, where the jet is a Gaussian beam from the casing's
+    discharge face that falls 2.1 m over its reach; 12–36 °C colour ramp with a slow ripple; clipped to the
+    floor outline (a coverage texture) and stopped by walls and furniture (scene depth). **T** hides / shows it;
+  * **tracers** — pale dots on six closed loops per outlet (along the ceiling, down into the room, back along
+    the floor and up), drawn over the mist;
+  * temperatures come from the telemetry feed (live BMS, else the simulated BMS): units that are off are not
+    drawn, running units take their own air temperature (room sensor, else return air) and a cooling drop from
+    their design airflow. Without a feed the MATLAB thermal model's west/east zones drive it.
+  
+  While it is visible a banner says **"AIRFLOW ILLUSTRATION – schematic, not measured, not a CFD result"**,
+  names what drives the mist and shows the MATLAB thermal model's west/east zone temperatures as *simulation*.
+  Look tuning without a repackage: `-TwinMistGain=` (brightness, default 1.15), `-TwinMistDensity=` (1),
+  `-TwinMistDots=` (dots per loop, 8).
 * **B** buildings list (switch model without restarting), **Ctrl+V** paste a launch code, **R** retry,
   **P** screenshot.
 
@@ -157,23 +168,16 @@ PCs, put it behind a reverse proxy with TLS and set `TWIN_PUBLIC_URL` so launch 
 [-TwinTourRooms=N]` loads the building, waits for the navigation mesh, then records into
 `<dir>/tour_report.json`: the load timings and in-engine validation, inventory, nav path + reachability
 from the player-start room, click-to-walk arrival, wall collision, furniture selection, HVAC unit selection +
-telemetry identity matching, the airflow layer (paths, dots, disclaimer, MATLAB state), the optional model
+telemetry identity matching, the airflow layer (paths, dots, mist zones / driver / temperatures, disclaimer, MATLAB state; `airflow.png` in
+the unit's room and `airflow_above.png` from above), the optional model
 switch, screenshots, average fps — and exits (code 3 when the building cannot be loaded; the report then
 holds `load_error`). `tests/viewer_harness.py` drives it.
 
-## Pixel Streaming (prepared, not implemented)
+## Pixel Streaming (browser, local test)
 
-Nothing here assumes a local user: all inputs come from the command line / launch file, all data from the
-API, and the HUD is drawn in-engine. To stream to a browser later:
-
-1. enable the `PixelStreaming2` plugin in `TwinWalkthrough.uproject` and package again;
-2. run instances on a GPU host with `-PixelStreamingURL=ws://<signalling>:8888 -RenderOffscreen
-   -TwinServer=<internal backend url> -TwinProject=<p> -TwinBuild=<b> -TwinTokenFile=<per-session file>`;
-3. a small session broker (backend side) mints one short-lived, build-scoped token per browser session
-   (`mint(projects=[p], build=b, ttl_hours=1)`), starts / reuses an instance and hands the browser the
-   signalling URL — the token never reaches the browser;
-4. the web app embeds the Pixel Streaming player instead of downloading a `.twinview` file.
-
+The same viewer streams into the web app with Unreal's Pixel Streaming 2 plugin (enabled in
+`TwinWalkthrough.uproject`; without `-PixelStreamingConnectionURL` it stays off, so the desktop viewer behaves as
+before). Streaming mode, the local session launcher and the hosting plan are in [PIXEL_STREAMING.md](PIXEL_STREAMING.md).
 No GPU streaming infrastructure is deployed by this repository.
 
 ## Tests
@@ -182,7 +186,7 @@ No GPU streaming infrastructure is deployed by this repository.
 |---|---|---|
 | `tests/test_viewer.py` | automated (synthetic GLB written by the test) | token signing / scope / expiry / tamper, secret per data dir, log redaction, glTF→Unreal conversion incl. a rotated node, pre-flight catches a 2.5 cm misplacement, MATLAB state selection, API auth + scope + 401/403/404/409, HVAC live labelled simulated → live (measured) with unknown/missing units, airflow labelled illustration, launch link |
 | `tests/test_viewer.py::test_blender_glb_matches_scene_model` | **real Blender** | the real glTF export matches the scene model in Unreal space |
-| `tests/test_unreal_viewer.py` | **real packaged Unreal viewer** + real Blender | build → backend → packaged exe loads it at runtime: in-engine bounds check, nav path, click-to-walk, wall collision, selection, HVAC selection + telemetry identity, airflow layer, building switch, bad-token and unreachable-server errors exit cleanly, no secrets in the package |
+| `tests/test_unreal_viewer.py` | **real packaged Unreal viewer** + real Blender | build → backend → packaged exe loads it at runtime: in-engine bounds check, nav path, click-to-walk, wall collision, selection, HVAC selection + telemetry identity, airflow layer (mist zones, parameter names, feed-driven temperatures, a unit that is off draws nothing), building switch, bad-token and unreachable-server errors exit cleanly, no secrets in the package |
 
 ### Verified (2026-10-14, UE 5.8.3, Windows 11, laptop GPU)
 
@@ -199,7 +203,9 @@ Shipping package: 382 MB; average 78–84 fps during the scripted tours.
 * Procedural mesh components are drawn without Nanite and without mesh distance fields, so Lumen GI is
   screen-space only; room point lights do not cast shadows (performance on laptops).
 * No multi-level buildings yet (the scene model has one level per build).
-* The airflow layer is an illustration by design; there is no CFD in the viewer.
+* The airflow layer is an illustration by design; there is no CFD in the viewer. As on the web, a unit's mist
+  zone is a ±3 m box around it: it stops at the wall you look at but is not cut to the unit's room, and the
+  web Live tab's room isolation and MATLAB timeline are not in the viewer.
 * Live BMS data arrives only when something pushes it to `POST /api/projects/{p}/hvac/telemetry`;
   otherwise the simulated BMS is shown and labelled as such.
 * The launch route has no user accounts behind it yet (see OPERATIONS.md roadmap).

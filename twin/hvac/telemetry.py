@@ -3,6 +3,7 @@
 Reading (per unit):  on, mode, setpoint_c, supply_air_c, return_air_c, fan_speed (0..1), airflow_lps,
                      room_temp_c (optional sensor), alarm (optional text), ts (unix seconds)
 Site:                outdoor_c, occupancy (0..1), ts
+Sensor (per sensor of the scene's sensor layer, by tag, id or BMS point):  value, humidity (optional), ts
 
 Real data is pushed to POST /api/projects/{pid}/hvac/telemetry (units by tag or id). When no real reading
 arrived for a project within LIVE_TIMEOUT_S, /hvac/live serves the simulated BMS instead and says so.
@@ -53,8 +54,16 @@ class SiteReading(BaseModel):
     occupancy: float | None = Field(default=None, ge=0, le=1)
 
 
+class SensorReading(BaseModel):
+    sensor: str = Field(min_length=1, max_length=120, description="sensor tag (e.g. TS-01), id or BMS point name")
+    ts: float | None = None
+    value: float = Field(ge=-1e6, le=1e6, allow_inf_nan=False)
+    humidity: float | None = Field(default=None, ge=0, le=100, description="combined temperature + humidity sensors")
+
+
 class TelemetryBody(BaseModel):
     readings: list[UnitReading] = Field(default_factory=list, max_length=2000)
+    sensors: list[SensorReading] = Field(default_factory=list, max_length=4000)
     site: SiteReading | None = None
 
 
@@ -64,14 +73,15 @@ class TelemetryStore:
 
     def __init__(self, history: int = 720) -> None:
         self._latest: dict[str, dict[str, dict]] = {}
+        self._sensors: dict[str, dict[str, dict]] = {}
         self._site: dict[str, dict] = {}
         self._history: dict[str, deque] = {}
         self._n = history
         self._lock = threading.Lock()
 
-    def ingest(self, pid: str, body: TelemetryBody, resolve) -> dict:
+    def ingest(self, pid: str, body: TelemetryBody, resolve, resolve_sensor=None) -> dict:
         now = time.time()
-        accepted, unknown = 0, []
+        accepted, unknown, sensors_ok, unknown_sensors = 0, [], 0, []
         with self._lock:
             latest = self._latest.setdefault(pid, {})
             for r in body.readings:
@@ -84,13 +94,31 @@ class TelemetryStore:
                 d["unit_id"] = uid
                 latest[uid] = d
                 accepted += 1
+            sens = self._sensors.setdefault(pid, {})
+            for r in body.sensors:
+                sid = resolve_sensor(r.sensor) if resolve_sensor else None
+                if sid is None:
+                    unknown_sensors.append(r.sensor)
+                    continue
+                sens[sid] = {**r.model_dump(), "ts": r.ts or now, "sensor_id": sid}
+                sensors_ok += 1
             if body.site:
                 s = body.site.model_dump()
                 s["ts"] = s["ts"] or now
                 self._site[pid] = s
             self._history.setdefault(pid, deque(maxlen=self._n)).append(
-                {"ts": now, "units": {k: dict(v) for k, v in latest.items()}, "site": self._site.get(pid)})
-        return {"accepted": accepted, "unknown_units": unknown[:50]}
+                {"ts": now, "units": {k: dict(v) for k, v in latest.items()}, "site": self._site.get(pid),
+                 "sensors": {k: dict(v) for k, v in sens.items()}})
+        out = {"accepted": accepted, "unknown_units": unknown[:50]}
+        if body.sensors:
+            out.update(sensors_accepted=sensors_ok, unknown_sensors=unknown_sensors[:50])
+        return out
+
+    def live_sensors(self, pid: str) -> dict[str, dict]:
+        """Fresh real sensor readings of a project (older than LIVE_TIMEOUT_S are dropped)."""
+        with self._lock:
+            now = time.time()
+            return {k: dict(v) for k, v in self._sensors.get(pid, {}).items() if now - v["ts"] <= LIVE_TIMEOUT_S}
 
     def live(self, pid: str) -> tuple[dict, dict | None, float] | None:
         with self._lock:
@@ -163,3 +191,41 @@ def simulate(domain: dict, t: float | None = None) -> tuple[dict[str, dict], dic
                              "fan_speed": fan, "airflow_lps": round(u["airflow_lps"] * fan, 1),
                              "room_temp_c": None, "alarm": alarm}
     return readings, {"ts": t, "outdoor_c": out_c, "occupancy": occ}
+
+
+def simulate_sensors(sensors: list[dict], units: dict[str, dict], site: dict, t: float | None = None) -> dict[str, dict]:
+    """Simulated readings of the sensor layer, consistent with the simulated (or live) unit readings: a room sensor
+    reads its unit's zone air (warmer higher up), CO2 and occupancy follow the site occupancy curve.
+
+    ``sensors``: [{id, kind, unit_id, height_m, area_m2}] (area of the sensor's room, for occupancy)."""
+    t = time.time() if t is None else t
+    occ = site.get("occupancy") if site.get("occupancy") is not None else occupancy(t)
+    out_c = site.get("outdoor_c") if site.get("outdoor_c") is not None else outdoor_c(t)
+    out: dict[str, dict] = {}
+    for n, s in enumerate(sensors):
+        u = units.get(s.get("unit_id") or "")
+        wobble = math.sin(t / 600.0 + n * 2.3)
+        running = bool(u and u.get("on") and u.get("return_air_c") is not None)
+        zone = u["return_air_c"] if running else (out_c - 2.0 if u else 25.5 + 0.8 * wobble)
+        k = s["kind"]
+        extra: dict = {}
+        if k in ("temperature", "temp_humidity"):
+            value = zone + 0.35 * ((s.get("height_m") or 1.5) - 1.5) + 0.15 * wobble
+            if k == "temp_humidity":
+                extra["humidity"] = round(52 + 6 * wobble + 6 * occ + (0 if running else 10), 1)
+        elif k == "humidity":
+            value = 52 + 6 * wobble + 6 * occ + (0 if running else 10)
+        elif k == "co2":
+            value = 430 + 650 * occ * (1 + 0.15 * wobble) + (0 if running else 250)
+        elif k == "pressure":
+            value = (12.0 + 2.0 * wobble) * ((u.get("fan_speed") or 0.0) if u else 1.0)
+        elif k == "occupancy":
+            value = round(occ * max(1.0, (s.get("area_m2") or 20.0) / 4.0) * (0.85 + 0.15 * wobble))
+        elif k == "airflow":
+            value = (u.get("airflow_lps") or 0.0) if u else 0.0
+        elif k == "energy":
+            value = 0.35 * (u.get("airflow_lps") or 0.0) / 100.0 * (u.get("fan_speed") or 0.0) if u else 0.0
+        else:
+            continue
+        out[s["id"]] = {"sensor_id": s["id"], "ts": t, "value": round(float(value), 2), **extra}
+    return out

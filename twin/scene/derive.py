@@ -207,7 +207,9 @@ def fit_to_overall(scene: Scene, outer_width: float, outer_depth: float) -> Scen
     openings = [o.model_copy(update={"offset": round(o.offset * new[o.wall_id].length / old[o.wall_id].length, 4)})
                 for o in scene.openings]
     furniture = [f.model_copy(update={"position": tf(f.position)}) for f in scene.furniture]
-    out = scene.model_copy(update={"walls": walls, "rooms": rooms, "openings": openings, "furniture": furniture})
+    sensors = [s.model_copy(update={"position": tf(s.position)}) for s in scene.sensors]
+    out = scene.model_copy(update={"walls": walls, "rooms": rooms, "openings": openings, "furniture": furniture,
+                                   "sensors": sensors})
     return Scene.model_validate(out.model_dump())
 
 

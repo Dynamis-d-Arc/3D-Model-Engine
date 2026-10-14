@@ -26,8 +26,12 @@
 4. **Generate** (Blender job): `compile_scene` turns the version into a build plan (prisms with cap
    triangulations, furniture placements, lights, cameras, expected bounds, content hashes). Blender
    builds, saves, exports; a second Blender process re-imports every export; the backend compares
-   Blender's report and the re-import report with the plan (1 mm tolerance). Only then is the build
-   `completed` and `manifest.json` written.
+   Blender's report and the re-import report with the plan (1 mm tolerance). Blender's glTF is kept as
+   `export/web/geometry.glb` and `export/web/scene.glb` = geometry + the sensor layer (`twin/layers.py`).
+   Only then is the build `completed` and `manifest.json` written.
+4b. **Update in place** (layer build, no Blender): a version whose building is identical to a saved build's
+   (only sensors changed) reuses that build's files through hard links and rewrites only the sensor layer —
+   seconds instead of minutes. See [SENSORS.md](SENSORS.md).
 5. **Desktop viewer** (no job, no editor): the web app mints a read-only viewer token; the packaged viewer
    downloads the build's verified glTF + viewer manifest over `/api/viewer/v1`, builds the walkthrough at
    runtime and re-checks every actor against the scene model ([UNREAL_VIEWER.md](UNREAL_VIEWER.md)).
@@ -50,11 +54,15 @@ twin.sqlite                         projects, files, versions, jobs, builds, ai_
 projects/<p_id>/uploads/<f_id>/     original.<ext>, normalized.png, thumb.png
 projects/<p_id>/versions/vNNNN.json immutable scene versions
 projects/<p_id>/builds/<b_id>/      plan.json, scene.json, scene.blend, export/…, preview/…,
-                                    blender_report.json, verify_report.json, manifest.json, unreal/…
+                                    export/web/geometry.glb (Blender) + scene.glb (+ layers), sensors.json,
+                                    blender_report.json, verify_report.json, layer_report.json, manifest.json, unreal/…
 ```
 
 Builds belong to one project version and live in their own directory, so a later build never touches
-an earlier one. Reuse across builds is explicit: `reuse.json` lists the exports copied from the
+an earlier one. `builds.kind` is `full` (Blender) or `layer` (a saved build reused with new layers;
+`previous_build` = the build it updates, `manifest.geometry_build` = the Blender build the geometry comes
+from). Layer builds hard-link the files they reuse; nothing in a build directory is modified after it
+completes, so the links are safe. Versions store `changes` against their parent. Reuse across builds is explicit: `reuse.json` lists the exports copied from the
 previous build because their content hash is unchanged.
 
 ## Regenerating a room

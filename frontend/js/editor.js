@@ -20,6 +20,11 @@ let report = null, reportError = null;
 const view = { cx: 5, cy: 4, zoom: 60, w: 800, h: 600 };
 let underlay = { visible: true, opacity: 0.45 };
 let hvacVisible = true;
+let sensorsVisible = true;
+/** the loaded version as saved: its sensors and everything else, to tell layer-only edits from building edits */
+let savedSensors = "[]", savedBuilding = "";
+let layerOffer = null;   // {version, options}: after a save that changed only sensors, offer the in-place update
+let layerJob = null;
 let hvacJob = null, fixJob = null, furnJob = null;
 let furnEstimate = null;   // {key, data}: cost estimate of the furniture detection for the loaded version
 let mode = "select";
@@ -74,6 +79,54 @@ function furnSize(f) {
   return a ? a.size : [0.5, 0.5, 0.5];
 }
 const byId = (coll, id) => scene[coll].find((e) => e.id === id);
+const sensorKind = (k) => state.catalog.sensor_kinds.find((x) => x.id === k) || { id: k, label: k, color: "#6F7782", prefix: "S", unit: "" };
+/** scene JSON without the sensor layer and bookkeeping (what decides whether the building must be regenerated) */
+function buildingJson(sc) {
+  const { sensors, provenance, open_questions, ...rest } = sc;
+  return JSON.stringify(rest);
+}
+function sensorChanges() {
+  const a = Object.fromEntries(JSON.parse(savedSensors).map((x) => [x.id, x]));
+  const b = Object.fromEntries((scene.sensors || []).map((x) => [x.id, x]));
+  const out = { added: [], removed: [], moved: [], edited: [] };
+  for (const id of Object.keys(b)) if (!a[id]) out.added.push(b[id].tag);
+  for (const id of Object.keys(a)) if (!b[id]) out.removed.push(a[id].tag);
+  for (const id of Object.keys(b)) {
+    if (!a[id] || JSON.stringify(a[id]) === JSON.stringify(b[id])) continue;
+    const moved = ["position", "elevation", "mounting", "level_id"].some((k) => JSON.stringify(a[id][k]) !== JSON.stringify(b[id][k]));
+    (moved ? out.moved : out.edited).push(b[id].tag);
+  }
+  return out;
+}
+function nextTag(kind) {
+  const prefix = sensorKind(kind).prefix;
+  const tags = new Set(scene.sensors.map((x) => x.tag));
+  let n = 1 + Math.max(0, ...scene.sensors.map((x) => (x.tag.match(new RegExp(`^${prefix}-(\\d+)$`)) || [])[1]).filter(Boolean).map(Number));
+  while (tags.has(`${prefix}-${String(n).padStart(2, "0")}`)) n++;
+  return `${prefix}-${String(n).padStart(2, "0")}`;
+}
+function nextSensorId() {
+  const nums = scene.sensors.map((x) => /^S(\d+)$/.exec(x.id)).filter(Boolean).map((m) => Number(m[1]));
+  return `S${Math.max(0, ...nums) + 1}`;
+}
+function roomAt(x, y) {
+  return scene.rooms.find((r) => pointInPoly(x, y, r.polygon)) || null;
+}
+/** Nearest wall face within `reach` of (x, y): the point on that face, pushed out by the marker radius. */
+function wallFacePoint(x, y, reach = 1.0) {
+  let best = null;
+  for (const w of scene.walls) {
+    const f = frame(w);
+    const s = (x - w.start[0]) * f.ux + (y - w.start[1]) * f.uy;
+    const d = (x - w.start[0]) * f.nx + (y - w.start[1]) * f.ny;
+    if (s < 0.05 || s > f.L - 0.05) continue;
+    const gap = Math.abs(d) - w.thickness / 2;
+    if (gap > reach || (best && gap >= best.gap)) continue;
+    const side = d >= 0 ? 1 : -1;
+    best = { gap, wall: w.id, p: f.at(s, side * (w.thickness / 2 + 0.065)).map(r3) };
+  }
+  return best;
+}
 const HVAC_COLL = { hvac_unit: "units", hvac_terminal: "terminals", duct: "ducts" };
 const hvacById = (type, id) => (scene.hvac?.[HVAC_COLL[type]] || []).find((e) => e.id === id);
 const hvacCount = () => (scene?.hvac ? scene.hvac.units.length + scene.hvac.terminals.length + scene.hvac.ducts.length : 0);
@@ -120,10 +173,11 @@ function deleteSelection() {
   const s = sel;
   edit(() => {
     if (s.type === "furniture") scene.furniture = scene.furniture.filter((f) => f.id !== s.id);
+    if (s.type === "sensor") scene.sensors = scene.sensors.filter((x) => x.id !== s.id);
     if (s.type in HVAC_COLL) {
       const key = HVAC_COLL[s.type];
       scene.hvac[key] = scene.hvac[key].filter((e) => e.id !== s.id);
-      if (s.type === "hvac_unit") for (const e of [...scene.hvac.terminals, ...scene.hvac.ducts]) if (e.unit_id === s.id) e.unit_id = null;
+      if (s.type === "hvac_unit") for (const e of [...scene.hvac.terminals, ...scene.hvac.ducts, ...scene.sensors]) if (e.unit_id === s.id) e.unit_id = null;
     }
     if (s.type === "opening") scene.openings = scene.openings.filter((o) => o.id !== s.id);
     if (s.type === "wall") {
@@ -134,6 +188,7 @@ function deleteSelection() {
       scene.rooms = scene.rooms.filter((r) => r.id !== s.id);
       scene.furniture = scene.furniture.filter((f) => f.room_id !== s.id);
       scene.openings.forEach((o) => { if (o.opens_into === s.id) o.opens_into = null; });
+      for (const e of [...scene.sensors, ...scene.hvac.units, ...scene.hvac.terminals]) if (e.room_id === s.id) e.room_id = null;
     }
   });
   sel = null;
@@ -152,6 +207,10 @@ async function loadVersion(n, force = false) {
   try {
     const v = await get(`/api/projects/${state.project.id}/versions/${n}`);
     scene = v.scene;
+    scene.sensors = scene.sensors || [];
+    savedSensors = JSON.stringify(scene.sensors);
+    savedBuilding = buildingJson(scene);
+    if (layerOffer && layerOffer.version !== n) layerOffer = null;
     loadedVersion = n;
     loadedProject = state.project.id;
     report = v.validation;
@@ -164,7 +223,14 @@ async function loadVersion(n, force = false) {
 }
 
 async function save() {
-  const v = await ask("Save as a new version", [{ name: "note", label: "What changed?", value: "edited in review" }], "Save");
+  const sc = sensorChanges();
+  const onlySensors = buildingJson(scene) === savedBuilding;
+  const nSensor = sc.added.length + sc.removed.length + sc.moved.length + sc.edited.length;
+  const note = onlySensors && nSensor
+    ? [sc.added.length && `add sensor${sc.added.length > 1 ? "s" : ""} ${sc.added.join(", ")}`, sc.moved.length && `move ${sc.moved.join(", ")}`,
+      sc.edited.length && `edit ${sc.edited.join(", ")}`, sc.removed.length && `remove ${sc.removed.join(", ")}`].filter(Boolean).join("; ").slice(0, 300)
+    : "edited in review";
+  const v = await ask("Save as a new version", [{ name: "note", label: `What changed? (v${loadedVersion} stays as it is)`, value: note }], "Save");
   if (!v) return;
   try {
     const res = await post(`/api/projects/${state.project.id}/versions`, { scene, parent: loadedVersion, note: v.note || "edited", source: "edit" });
@@ -172,7 +238,33 @@ async function save() {
     await refreshProject();
     await loadVersion(res.number, true);
     toast(`Saved version ${res.number}${res.validation.can_generate ? " — ready to generate" : ""}`, "ok");
+    if (res.validation.can_generate && res.changes && !res.changes.geometry_changed) {
+      try {
+        const opts = await get(`/api/projects/${state.project.id}/versions/${res.number}/build-options`);
+        if (opts.layer.possible && !opts.layer.up_to_date) { layerOffer = { version: res.number, options: opts }; drawSide(); }
+      } catch { /* the Generate tab offers it too */ }
+    }
   } catch (e) { showError(e, "Saving failed"); }
+}
+
+/** Step 9 of the flow: put this version's sensor layer on the saved model (no Blender, seconds). */
+async function updateSavedModel(version) {
+  try {
+    const job = await post(`/api/projects/${state.project.id}/versions/${version}/build`, { mode: "layer" });
+    layerJob = job;
+    drawSide();
+    const { watchJob } = await import("./app.js");
+    const final = await watchJob(job.id, (j) => { layerJob = j; drawSide(); });
+    layerJob = null;
+    layerOffer = null;
+    await refreshProject();
+    if (final.status === "completed") {
+      const r = final.result;
+      state.buildId = r.build_id;
+      toast(`3D model updated in ${r.timings?.total_s ?? "?"} s: ${r.sensors} sensors on the saved building (build ${r.base_build.slice(2)}). Nothing was regenerated.`, "ok", 9000);
+      switchTab("generate");
+    } else showError(final.error || { message: "failed" }, "Updating the 3D model");
+  } catch (e) { layerJob = null; drawSide(); showError(e, "Updating the 3D model"); }
 }
 
 function scheduleValidate() {
@@ -353,6 +445,7 @@ function draw() {
       t2.textContent = `${fmtM(sm.width_clear)} × ${fmtM(sm.depth_clear)} m · ${fmtM(sm.area_net, 1)} m²`;
     }
   }
+  if (sensorsVisible && scene.sensors?.length) drawSensors(bad);
   // vertex handles for the selected room
   if (sel?.type === "room") {
     const r = byId("rooms", sel.id);
@@ -447,6 +540,87 @@ function drawHvac() {
   }
 }
 
+/** Sensor layer: a dot in the kind's colour (ring = needs review, red ring = has an issue), tag when zoomed in;
+ * the selected sensor shows a dashed link to the unit it monitors. Dots drag; Alt = no snap. */
+function drawSensors(bad) {
+  const g = s("g", {}, svg);
+  const unitPos = Object.fromEntries((scene.hvac?.units || []).map((u) => [u.id, u.position]));
+  const R = Math.max(4.5, Math.min(9, 0.09 * view.zoom));
+  for (const se of scene.sensors) {
+    const [x, y] = se.position;
+    const isSel = sel?.type === "sensor" && sel.id === se.id;
+    if (isSel && se.unit_id && unitPos[se.unit_id]) {
+      const [ux, uy] = unitPos[se.unit_id];
+      s("line", { x1: sx(x), y1: sy(y), x2: sx(ux), y2: sy(uy), class: "svg-sensor-link" }, g);
+    }
+    const review = STATUS_NEEDS.includes(se.certainty?.status);
+    const el = s("circle", { cx: sx(x), cy: sy(y), r: R, fill: sensorKind(se.kind).color,
+      class: "svg-sensor" + (se.mounting === "ceiling" ? " ceiling" : "") + (review ? " review" : "") +
+        (bad.has(`sensor:${se.id}`) ? " bad" : "") + (isSel ? " sel" : "") }, g);
+    s("title", {}, el).textContent = `${se.tag} · ${sensorKind(se.kind).label}${se.bms_point ? ` · ${se.bms_point}` : ""}`;
+    if (view.zoom > 28 || isSel) {
+      const t = s("text", { x: sx(x) + R + 2, y: sy(y) + 3, class: "svg-label sensor" }, g);
+      t.textContent = se.tag;
+    }
+    el.addEventListener("pointerdown", (e) => {
+      if (mode !== "select") return;
+      e.stopPropagation();
+      select({ type: "sensor", id: se.id });
+      const off = [wx(e.offsetX) - x, wy(e.offsetY) - y];
+      startDrag(e, (px, py, ev) => { se.position = [r3(snap(px - off[0], ev)), r3(snap(py - off[1], ev))]; });
+    });
+  }
+}
+
+async function placeSensorClick(e) {
+  const x = r3(wx(e.offsetX)), y = r3(wy(e.offsetY));
+  const room = roomAt(x, y);
+  const units = scene.hvac?.units || [];
+  // default link: the unit serving this room, else the nearest one
+  const near = units.filter((u) => room && u.room_id === room.id)[0] ||
+    [...units].sort((a, b) => Math.hypot(a.position[0] - x, a.position[1] - y) - Math.hypot(b.position[0] - x, b.position[1] - y))[0];
+  const kinds = state.catalog.sensor_kinds;
+  const lastKind = placeSensorClick.kind || "temperature";
+  const v = await ask(`New sensor ${room ? `in ${room.name}` : "(outside every room)"}`, [
+    { name: "kind", label: "Type", value: lastKind, options: kinds.map((k) => [k.id, k.label]) },
+    { name: "tag", label: "Tag (empty = next free, e.g. TS-03)", value: "" },
+    { name: "mounting", label: "Mounting", value: placeSensorClick.mounting || "wall",
+      options: [["wall", "on the nearest wall"], ["ceiling", "under the ceiling"], ["free", "free-standing / exactly here"]] },
+    { name: "elevation", label: "Height above floor m (empty = 1.5 m, or under the ceiling)", type: "number", value: "" },
+    { name: "unit", label: "Monitors HVAC unit", value: near?.id || "", options: [["", "— none —"], ...units.map((u) => [u.id, u.tag])] },
+    { name: "bms", label: "BMS / IoT point (for live readings)", value: "" },
+  ], "Place");
+  if (!v) return;
+  placeSensorClick.kind = v.kind;
+  placeSensorClick.mounting = v.mounting;
+  let pos = [x, y];
+  if (v.mounting === "wall") {
+    const face = wallFacePoint(x, y);
+    if (face) pos = face.p; else toast("No wall within 1 m: placed where you clicked.", "info");
+  }
+  const id = nextSensorId();
+  const tag = (v.tag || "").trim() || nextTag(v.kind);
+  if (scene.sensors.some((x2) => x2.tag === tag)) return toast(`Tag ${tag} is already used.`, "error");
+  edit(() => scene.sensors.push({ id, tag, kind: v.kind, level_id: (room?.level_id) || scene.levels[0].id,
+    room_id: roomAt(pos[0], pos[1])?.id ?? room?.id ?? null, position: pos, elevation: v.elevation ?? null,
+    mounting: v.mounting, unit_id: v.unit || null, bms_point: (v.bms || "").trim(), label: "",
+    certainty: { status: "confirmed", source: "user", confidence: null, note: "placed in review" } }));
+  sel = { type: "sensor", id };
+  drawAll();
+}
+
+async function importSensorSheet(file) {
+  if (!file) return;
+  try {
+    const text = await file.text();
+    const res = await post("/api/scene/import-sensors", { scene, text });
+    if (res.added.length || res.updated.length) edit(() => { scene = res.scene; });
+    const msg = `Sheet ${file.name}: ${res.added.length} added, ${res.updated.length} updated` +
+      (res.problems.length ? `, ${res.problems.length} row(s) skipped — ${res.problems.slice(0, 3).join("; ")}` : "");
+    toast(msg + (res.added.length || res.updated.length ? ". Check them, then save a new version." : ""), res.problems.length ? "error" : "ok", 12000);
+  } catch (e) { showError(e, "Sensor sheet"); }
+}
+
 function startDrag(e, apply) {
   snapshot();
   let moved = false;
@@ -482,11 +656,14 @@ function attachCanvasEvents() {
   }, { passive: false });
   svg.addEventListener("pointermove", (e) => {
     if (hintEl) hintEl.textContent = `x ${fmtM(wx(e.offsetX))} m · y ${fmtM(wy(e.offsetY))} m  —  ` +
-      (mode === "draw-room" ? "drag to draw a room (snaps to 5 cm) · Esc cancels" : "wheel = zoom · drag = pan · 1 grid = 1 m · origin = red cross");
+      (mode === "draw-room" ? "drag to draw a room (snaps to 5 cm) · Esc cancels"
+        : mode === "place-sensor" ? "click where the sensor goes (wall sensors snap to the nearest wall face) · Esc stops placing"
+          : "wheel = zoom · drag = pan · 1 grid = 1 m · origin = red cross");
   });
   svg.addEventListener("pointerdown", (e) => {
     if (mode === "calibrate") return calibrateClick(e);
     if (mode === "draw-room") return drawRoomStart(e);
+    if (mode === "place-sensor") return placeSensorClick(e);
     sel = null;
     drawSide();
     const start = { x: e.clientX, y: e.clientY, cx: view.cx, cy: view.cy };
@@ -750,7 +927,93 @@ function inspector() {
         h("span.spacer"), h("button.btn.small.danger", { onclick: deleteSelection }, "Delete")));
   }
   if (sel.type in HVAC_COLL) return hvacInspector();
+  if (sel.type === "sensor") return sensorInspector();
   return null;
+}
+
+function sensorInspector() {
+  const se = byId("sensors", sel.id);
+  if (!se) return null;
+  const k = sensorKind(se.kind);
+  const pos = (label, i) => numField(label, se.position[i], (v) => { const p = [...se.position]; p[i] = v ?? p[i]; se.position = p; });
+  const units = scene.hvac?.units || [];
+  return h("div.card.inspector", null,
+    h("div.row", null, h("span.sensor-dot", { style: { background: k.color } }), h("h2", { style: { margin: 0 } }, `${k.label} ${se.tag}`)),
+    h("div.kv", { style: { marginTop: "8px" } },
+      ...textField("Tag", se.tag, (v) => { if (v && !scene.sensors.some((x) => x.tag === v && x.id !== se.id)) se.tag = v; else toast("Tags must be unique.", "error"); }),
+      ...selectField("Type", se.kind, state.catalog.sensor_kinds.map((x) => [x.id, x.label]), (v) => (se.kind = v)),
+      ...selectField("Mounting", se.mounting, [["wall", "wall"], ["ceiling", "ceiling"], ["free", "free-standing"]], (v) => (se.mounting = v)),
+      ...pos("x m", 0), ...pos("y m", 1),
+      ...numField("Height m", se.elevation, (v) => (se.elevation = v), { placeholder: se.mounting === "ceiling" ? "under the ceiling" : "1.5 (default)" }),
+      ...selectField("Room", se.room_id || "", [["", "— where it stands —"], ...scene.rooms.map((r) => [r.id, r.name])], (v) => (se.room_id = v || null)),
+      ...selectField("Monitors unit", se.unit_id || "", [["", "— none —"], ...units.map((u) => [u.id, u.tag])], (v) => (se.unit_id = v || null)),
+      ...textField("BMS point", se.bms_point, (v) => (se.bms_point = (v || "").trim())),
+      ...textField("Label", se.label, (v) => (se.label = v || "")),
+      ...certaintyRow(se)),
+    h("div.row", { style: { marginTop: "8px" } },
+      h("button.btn.small", { title: "Move it onto the face of the nearest wall (within 1 m)", onclick: () => {
+        const f = wallFacePoint(se.position[0], se.position[1]);
+        if (!f) return toast("No wall within 1 m.", "error");
+        edit(() => { se.position = f.p; se.mounting = "wall"; });
+      } }, "Snap to wall"),
+      h("button.btn.small", { onclick: () => edit(() => {
+        const id = nextSensorId();
+        scene.sensors.push({ ...structuredClone(se), id, tag: nextTag(se.kind), bms_point: "", position: [r3(se.position[0] + 0.5), se.position[1]] });
+        sel = { type: "sensor", id };
+      }) }, "Duplicate"),
+      h("button.btn.small", { onclick: () => fixDialog(`sensor:${se.id}`) }, "Fix with AI…"),
+      h("span.spacer"), h("button.btn.small.danger", { onclick: deleteSelection }, "Delete")));
+}
+
+/** Steps 6-9 of the flow in one card: the sensor layer of this version, what changed since it was saved, and the
+ * in-place update of the saved 3D model. */
+function sensorsCard() {
+  const list = scene.sensors || [];
+  const sc = sensorChanges();
+  const nChanged = sc.added.length + sc.removed.length + sc.moved.length + sc.edited.length;
+  const buildingChanged = buildingJson(scene) !== savedBuilding;
+  const fileIn = h("input", { type: "file", accept: ".csv,text/csv", style: { display: "none" },
+    onchange: (e) => { importSensorSheet(e.target.files[0]); e.target.value = ""; } });
+  const byKind = {};
+  for (const x of list) byKind[x.kind] = (byKind[x.kind] || 0) + 1;
+  const changeLine = !dirty ? null : h("div.notice." + (buildingChanged ? "warn" : nChanged ? "ok" : "info"), { style: { margin: "6px 0" } },
+    nChanged ? h("div", null, `Since v${loadedVersion}: ` + [sc.added.length && `${sc.added.length} added`, sc.moved.length && `${sc.moved.length} moved`,
+      sc.edited.length && `${sc.edited.length} edited`, sc.removed.length && `${sc.removed.length} removed`].filter(Boolean).join(", ") + " sensor(s).") : null,
+    h("div.small", null, buildingChanged
+      ? "The building itself changed too, so it will be generated again (Blender)."
+      : "Only the sensor layer changed: after saving, the saved 3D model is updated in place — nothing is regenerated."));
+  let offer = null;
+  if (layerJob) {
+    offer = h("div.notice", { style: { margin: "6px 0" } }, badge(layerJob.status), " ", layerJob.stage || "updating the saved model…");
+  } else if (layerOffer && layerOffer.version === loadedVersion && !dirty) {
+    const L = layerOffer.options.layer;
+    const c = L.changes;
+    offer = h("div.notice.ok", { style: { margin: "6px 0" } },
+      h("div", null, h("b", null, `v${loadedVersion} saved. `),
+        `Only sensors changed since the saved model (build ${L.base_build.id.slice(2)} · v${L.base_build.version}): ` +
+        [c.added.length && `${c.added.length} added`, c.moved.length && `${c.moved.length} moved`, c.edited.length && `${c.edited.length} edited`,
+          c.removed.length && `${c.removed.length} removed`].filter(Boolean).join(", ") + "."),
+      h("div.row", { style: { marginTop: "6px" } },
+        h("button.btn.primary", { onclick: () => updateSavedModel(loadedVersion) }, "Update the 3D model"),
+        h("span.small.muted", null, "walls, HVAC and furniture are reused as they are")));
+  }
+  return h("div.card", null,
+    h("div.row", null, h("h2", { style: { margin: 0 } }, "Sensors"), h("span.spacer"),
+      h("label.small", null, h("input", { type: "checkbox", checked: sensorsVisible, onchange: (e) => { sensorsVisible = e.target.checked; draw(); } }), " show")),
+    h("div.small", { style: { margin: "6px 0" } }, list.length
+      ? Object.entries(byKind).map(([kk, n]) => `${n}× ${sensorKind(kk).label.toLowerCase()}`).join(", ")
+      : "No sensors yet. Place them on the plan or import a placement sheet; the saved 3D model is then updated without regenerating it."),
+    changeLine, offer,
+    h("div.row", null,
+      h("button.btn.small" + (mode === "place-sensor" ? ".primary" : ""), { onclick: () => { mode = mode === "place-sensor" ? "select" : "place-sensor"; sel = null; drawAll(); },
+        title: "Click on the plan to place sensors; Esc stops" }, mode === "place-sensor" ? "Placing… (Esc)" : "+ Place sensors"),
+      h("button.btn.small", { onclick: () => fileIn.click(), title: "CSV: tag, kind, x, y, elevation, mounting, room, unit, bms_point, label" }, "Import sheet (CSV)"),
+      h("a.small", { href: "/api/sensors/template.csv" }, "template"), fileIn),
+    list.length ? h("div.sensor-list", null, list.slice(0, 200).map((x) => h("div.sensor-item" + (sel?.type === "sensor" && sel.id === x.id ? ".active" : ""),
+      { onclick: () => select({ type: "sensor", id: x.id }) },
+      h("span.sensor-dot", { style: { background: sensorKind(x.kind).color } }), h("b", null, x.tag),
+      h("span.small.muted", null, [scene.rooms.find((r) => r.id === (x.room_id || roomAt(...x.position)?.id))?.name,
+        x.elevation != null ? `${fmtM(x.elevation)} m` : x.mounting, x.bms_point].filter(Boolean).join(" · "))))) : null);
 }
 
 function hvacInspector() {
@@ -1000,7 +1263,7 @@ function issuesCard() {
   const issues = [...report.issues].sort((a, b) => order[a.severity] - order[b.severity]);
   const target = (t) => {
     const [type, id] = t.split(":");
-    if (["room", "wall", "opening", "furniture", "hvac_unit", "hvac_terminal", "duct"].includes(type)) select({ type, id });
+    if (["room", "wall", "opening", "furniture", "hvac_unit", "hvac_terminal", "duct", "sensor"].includes(type)) select({ type, id });
   };
   return h("div.card", null,
     h("div.row", null, h("h2", { style: { margin: 0 } }, "Validation"), h("span.spacer"),
@@ -1025,17 +1288,47 @@ function questionsCard() {
           h("button.btn.small", { onclick: () => edit(() => { q.answer = /** @type {HTMLInputElement} */ (document.getElementById(`qa-${q.id}`)).value; q.resolved = true; }) }, "Resolve")))));
 }
 
+/** "+2 sensors · 1 wall" from a version's stored change summary (vs its parent). */
+function changeChips(ch) {
+  if (!ch || !ch.counts) return null;
+  const names = { sensors: "sensor", rooms: "room", walls: "wall", openings: "opening", furniture: "furniture", hvac_units: "unit",
+    hvac_terminals: "terminal", ducts: "duct", materials: "material", levels: "level", open_questions: "question" };
+  const parts = Object.entries(ch.counts).map(([k, c]) => {
+    const n = c.added + c.removed + c.changed;
+    const sign = c.added && !c.removed && !c.changed ? "+" : c.removed && !c.added && !c.changed ? "−" : "~";
+    return `${sign}${n} ${names[k] || k}${n > 1 && !(names[k] || "").endsWith("ture") ? "s" : ""}`;
+  });
+  if (!parts.length && !ch.sections?.length) return null;
+  return h("span.small" + (ch.geometry_changed ? ".muted" : ".chg-layer"), { title: ch.geometry_changed ? "the building changed" : "only layers changed: the saved model can be updated in place" },
+    [...parts, ...(ch.sections || [])].join(" · "));
+}
+
 function versionsCard() {
   const vs = state.project.versions;
   return h("div.card", null, h("h2", null, "Versions"),
+    h("p.small.muted", { style: { margin: "0 0 6px" } }, "Every save is a new version; older ones never change. Open one to compare or restore it."),
     h("div.version-list", null, vs.map((v) => h("div.version-item" + (v.number === loadedVersion ? ".active" : ""), { onclick: () => loadVersion(v.number) },
-      h("b", null, `v${v.number}`), badge(v.source, "info"), v.can_generate ? badge("ready", "ok") : badge("review", "review"),
-      h("span.small.muted", { style: { overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, v.note)))));
+      h("b", null, `v${v.number}`), v.parent ? h("span.small.muted", null, `← v${v.parent}`) : null,
+      badge(v.source, "info"), v.can_generate ? badge("ready", "ok") : badge("review", "review"), changeChips(v.changes),
+      h("span.small.muted", { style: { overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, v.note)))),
+    loadedVersion !== vs[0]?.number && !dirty ? h("div.row", { style: { marginTop: "8px" } },
+      h("button.btn.small", { title: "Save this older version again as the newest one (nothing is deleted)", onclick: restoreVersion }, `Restore v${loadedVersion} as a new version`)) : null);
+}
+
+async function restoreVersion() {
+  const old = loadedVersion;
+  if (!(await confirmDialog(`Restore v${old}`, `Save a copy of v${old} as the newest version? Every version stays available.`, "Restore"))) return;
+  try {
+    const res = await post(`/api/projects/${state.project.id}/versions`, { scene, parent: old, note: `restored from v${old}`, source: "edit" });
+    await refreshProject();
+    await loadVersion(res.number, true);
+    toast(`v${old} restored as v${res.number}.`, "ok");
+  } catch (e) { showError(e, "Restore"); }
 }
 
 function drawSide() {
   if (!sideEl || !scene) return;
-  mount(sideEl, inspector(), fixCard(), furnitureCard(), hvacCard(), issuesCard(), questionsCard(), versionsCard());
+  mount(sideEl, inspector(), sensorsCard(), fixCard(), furnitureCard(), hvacCard(), issuesCard(), questionsCard(), versionsCard());
   drawToolbar();
 }
 
@@ -1049,6 +1342,8 @@ function drawToolbar() {
       title: "Drag a rectangle on the plan (wall centrelines); snaps to 5 cm, hold Alt for 1 mm" }, "Draw room"),
     h("button.btn.small", { onclick: addRoomDialog, title: "Add a rectangular room by typing its coordinates" }, "+ Room…"),
     h("button.btn.small", { onclick: addFurnitureDialog }, "+ Furniture"),
+    h("button.btn.small" + (mode === "place-sensor" ? ".primary" : ""), { onclick: () => { mode = mode === "place-sensor" ? "select" : "place-sensor"; sel = null; drawAll(); },
+      title: "Click on the plan to place sensors (Esc stops)" }, "+ Sensor"),
     h("button.btn.small", { onclick: () => serverTool("/api/scene/derive-walls", {}, (r) => `Walls rebuilt from rooms (${r.scene.walls.length} walls)${r.notes.length ? "; " + r.notes.join("; ") : ""}`), title: "Rebuild wall centrelines from room boundaries" }, "Derive walls"),
     h("button.btn.small", { onclick: fitToBrief, title: "Scale the layout to the brief's outer dimensions" }, "Fit to brief size"),
     h("button.btn.small", { onclick: startCalibration, disabled: !ul }, ul?.calibrated ? "Re-calibrate plan" : "Calibrate plan"),
@@ -1152,6 +1447,11 @@ export function renderReview(el) {
     else { scene = null; loadedProject = p.id; drawAll(); }
   });
   on("version", (n) => loadVersion(n, true));
+  on("select", async (target) => {   // e.g. "sensor:S3" from a picked object in the 3D preview
+    const [type, id] = String(target).split(":");
+    if (state.version != null && state.version !== loadedVersion) await loadVersion(state.version);
+    if (scene && state.version === loadedVersion) select({ type, id });
+  });
   on("tab", (t) => { if (t === "review") requestAnimationFrame(() => { measure(); draw(); }); });
 }
 

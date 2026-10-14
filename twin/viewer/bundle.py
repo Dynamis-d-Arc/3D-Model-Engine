@@ -150,6 +150,7 @@ def furniture_bounds_m(f: dict) -> tuple[list[float], list[float]]:
 def expected_bounds_ue(manifest: dict) -> dict[str, tuple[list[float], list[float]]]:
     out = {o["name"]: scene_bounds_to_ue(*o["bounds_m"]) for o in manifest["objects"]}
     out.update({f["name"]: scene_bounds_to_ue(*furniture_bounds_m(f)) for f in manifest["furniture"]})
+    out.update({s["name"]: scene_bounds_to_ue(*s["bounds_m"]) for s in manifest.get("sensors", [])})
     return out
 
 
@@ -224,6 +225,15 @@ def build_viewer_manifest(build_dir: Path, project_id: str, project_name: str, v
         elif o["kind"].startswith("hvac_") and unit_of.get(o.get("hvac_id")):
             e["unit_id"] = unit_of[o["hvac_id"]]
         objects.append(e)
+    for s in manifest.get("sensors", []):   # the sensor layer: selectable, never blocks movement
+        e = {"name": s["name"], "kind": "sensor", "room_id": s.get("room_id"), "room_name": s.get("room_name"),
+             "label": s["label"], "collision": "none", "bounds_cm": scene_bounds_to_ue(*s["bounds_m"]),
+             "location_cm": s["unreal"]["location_cm"]}
+        for k in ("sensor_id", "tag", "bms_point", "unit_id", "unit_tag", "mounting", "height_m"):
+            if s.get(k) is not None:
+                e[k] = s[k]
+        e["sensor_kind"] = s["kind"]
+        objects.append(e)
     furniture = []
     for f in manifest["furniture"]:
         w, d, h = f["size_m"]
@@ -245,7 +255,8 @@ def build_viewer_manifest(build_dir: Path, project_id: str, project_name: str, v
         "format": "twin-viewer-manifest", "manifest_version": VIEWER_MANIFEST_VERSION,
         "project": {"id": project_id, "name": project_name, "style": manifest["project"].get("style")},
         "build": {"id": manifest["build_id"], "version": version, "created_at": manifest.get("created_at"),
-                  "scene_hash": manifest.get("scene_hash"), "blender": manifest.get("blender")},
+                  "scene_hash": manifest.get("scene_hash"), "blender": manifest.get("blender"),
+                  "kind": manifest.get("build_kind", "full"), "geometry_build": manifest.get("geometry_build")},
         "units": {"model": "glTF 2.0 binary, metres, +Y up (Blender export)", "viewer": "Unreal cm, Z up"},
         "conversion": "UE(cm) = 100 * (x_gltf, z_gltf, y_gltf) = (100 x, -100 y, 100 z) of the scene model",
         "model": {"path": "model.glb", "bytes": model.stat().st_size, "sha256": _sha256(model),
@@ -266,6 +277,7 @@ def build_viewer_manifest(build_dir: Path, project_id: str, project_name: str, v
         "player_start": {"location_cm": ps["unreal"]["location_cm"], "yaw_deg": ps["unreal"]["yaw_deg"],
                          "room_id": ps.get("room_id")},
         "hvac": {"units": hvac_units, "terminals": len(hv.get("terminals", [])), "ducts": len(hv.get("ducts", []))},
+        "sensors": len(manifest.get("sensors", [])),
         "endpoints": {"live": "hvac/live", "airflow": "hvac/airflow"},
         "poll_seconds": 4,
         "validation": {"tolerance_cm": TOL_CM},

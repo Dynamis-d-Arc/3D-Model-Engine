@@ -21,12 +21,15 @@ from twin.assets.catalog import CATALOG_PATH
 from twin.blender.runner import (SCRIPTS_DIR, BlenderError, BlenderNotConfigured, blender_version, require_blender,
                                  run_script)
 from twin.config import PROJECT_ROOT, Settings
+from twin.layers import (GEOMETRY_REL, LAYER_REPORT_REL, MODEL_REL, SENSORS_REL, LayerError, apply_layers,
+                         sensor_entries)
 from twin.scene import geometry as g
 from twin.scene.compile import LIBRARY_VERSION, compile_scene
 from twin.scene.model import Material, Scene
 from twin.scene.textures import ensure_texture
 from twin.scene.transforms import scene_to_unreal_location, scene_to_unreal_yaw
 from twin.scene.validate import validate_scene
+from twin.viewer.bundle import BundleError
 
 LIBRARY_DIR = PROJECT_ROOT / "assets_build"
 TEXTURE_CACHE = PROJECT_ROOT / "assets_build" / "textures"
@@ -167,7 +170,7 @@ def player_start(scene: Scene, plan: dict) -> dict:
 
 
 def write_manifest(scene: Scene, plan: dict, build_dir: Path, build_id: str, report: dict, verify: dict,
-                   blender_ver: str, reused: list[str]) -> dict:
+                   blender_ver: str, reused: list[str], layer: dict | None = None) -> dict:
     """Everything the Unreal importer and the web viewer need, in one file."""
     def ue_loc(p):
         return [round(v, 4) for v in scene_to_unreal_location(*p)]
@@ -216,6 +219,10 @@ def write_manifest(scene: Scene, plan: dict, build_dir: Path, build_id: str, rep
     manifest = {
         "manifest_version": MANIFEST_VERSION,
         "build_id": build_id,
+        # "full" = Blender built the geometry; "layer" = a saved build reused with new layers on top
+        "build_kind": "full",
+        "geometry_build": build_id,
+        "base_build": None,
         "project": plan["project"],
         "scene_hash": plan["scene_hash"],
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -234,14 +241,41 @@ def write_manifest(scene: Scene, plan: dict, build_dir: Path, build_id: str, rep
         "exports": exports,
         "files": {
             "blend": "scene.blend", "fbx_full": "export/fbx/scene_full.fbx", "glb": "export/web/scene.glb",
+            "glb_geometry": GEOMETRY_REL, "sensors": SENSORS_REL,
             "plan": "plan.json", "scene": "scene.json", "previews": report.get("renders", []),
         },
         "verification": {"blender_report": "blender_report.json", "verify_report": "verify_report.json",
                          "files_checked": verify["checked"], "max_reimport_delta_m": verify["max_delta_m"],
-                         "tolerance_m": TOL_M},
+                         "tolerance_m": TOL_M, "layer_report": LAYER_REPORT_REL,
+                         "layer_max_deviation_cm": (layer or {}).get("max_deviation_cm")},
         "reused_exports": reused,
+        "sensors": sensor_entries(plan),
+        "layers": {"sensors": {"count": len(plan.get("sensors", [])), "file": SENSORS_REL}},
         "accepted_estimates": plan["accepted_estimates"],
     }
+    (build_dir / "manifest.json").write_text(json.dumps(manifest, indent=1), encoding="utf-8")
+    return manifest
+
+
+def write_layer_manifest(build_dir: Path, base: dict, plan: dict, *, build_id: str, base_id: str,
+                         base_version: int | None, report: dict, timings: dict) -> dict:
+    """Manifest of a layer build: the saved build's manifest (its geometry, exports and Blender
+    verification still describe the linked files) with the new layers and identity."""
+    manifest = json.loads(json.dumps(base))
+    files = manifest.setdefault("files", {})
+    files.update({"glb": MODEL_REL, "glb_geometry": GEOMETRY_REL, "sensors": SENSORS_REL})
+    manifest.update({
+        "build_id": build_id, "build_kind": "layer", "base_build": base_id, "base_version": base_version,
+        "geometry_build": base.get("geometry_build") or base_id,
+        "scene_hash": plan["scene_hash"], "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "sensors": sensor_entries(plan),
+        "layers": {"sensors": {"count": len(plan.get("sensors", [])), "file": SENSORS_REL,
+                               "changes": report.get("changes")}},
+        "accepted_estimates": plan["accepted_estimates"],
+        "timings": timings,
+    })
+    manifest.setdefault("verification", {}).update({"layer_report": LAYER_REPORT_REL,
+                                                     "layer_max_deviation_cm": report["max_deviation_cm"]})
     (build_dir / "manifest.json").write_text(json.dumps(manifest, indent=1), encoding="utf-8")
     return manifest
 
@@ -312,7 +346,13 @@ def run_build(scene: Scene, build_dir: Path, settings: Settings, *, build_id: st
     if verify["failures"]:
         raise BuildFailed("EXPORT_VERIFY_FAILED", "Re-imported exports do not match the scene model.",
                           {"failures": verify["failures"][:50]})
-    manifest = write_manifest(scene, plan, build_dir, build_id, report, verify, version, report.get("reused", []))
+    progress(0.97, "adding the sensor layer")
+    try:  # Blender's glTF becomes geometry.glb; scene.glb = geometry + layers (what every viewer loads)
+        layer = apply_layers(build_dir, plan)
+    except (LayerError, BundleError) as exc:
+        raise BuildFailed(exc.code, str(exc), exc.detail) from exc
+    manifest = write_manifest(scene, plan, build_dir, build_id, report, verify, version, report.get("reused", []),
+                              layer)
     timings["total_s"] = round(time.time() - t0, 2)
     (build_dir / "timings.json").write_text(json.dumps(timings, indent=1), encoding="utf-8")
     progress(1.0, "completed")

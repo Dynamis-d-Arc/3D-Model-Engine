@@ -20,6 +20,7 @@ from shapely.ops import unary_union
 from twin.assets.catalog import load_catalog
 from twin.scene import geometry as g
 from twin.scene.model import NEEDS_REVIEW_STATUSES, Brief, Scene
+from twin.scene.sensors import check_sensors
 
 Severity = Literal["error", "review", "warning", "info"]
 BLOCKING: frozenset[str] = frozenset({"error", "review"})
@@ -352,6 +353,7 @@ def validate_scene(scene: Scene, brief: Brief | None = None) -> ValidationReport
             add("Q_OPEN_QUESTION", sev, q.question, *( [q.target] if q.target else []), f"question:{q.id}")
 
     _check_hvac(scene, add)
+    check_sensors(scene, add)
 
     # ---- brief cross-checks ----------------------------------------------------------
     if brief is not None:

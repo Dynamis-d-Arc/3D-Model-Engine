@@ -89,7 +89,12 @@ void ATwinHUD::DrawLoadScreen(ATwinPlayerController* PC, ATwinViewerDirector* D)
 		{
 			Lines.Add(TEXT("The viewer link is not valid any more: open the building again from the web app."));
 		}
-		Lines.Add(TEXT("R retry  |  B choose another building  |  Ctrl+V paste a new launch code  |  Esc quit"));
+		Lines.Add(PC->bStreaming ? TEXT("R retry  |  B choose another building")
+		                         : TEXT("R retry  |  B choose another building  |  Ctrl+V paste a new launch code  |  Esc quit"));
+	}
+	else if (D->State == ETwinLoadState::Idle && PC->bStreaming)
+	{
+		Lines.Add(TEXT("Waiting for the building of this session..."));
 	}
 	else if (D->State == ETwinLoadState::Idle)
 	{
@@ -191,11 +196,19 @@ void ATwinHUD::DrawAirflowBanner(ATwinViewerDirector* D)
 {
 	TArray<FString> Lines;
 	Lines.Add(TEXT("AIRFLOW ILLUSTRATION  -  schematic, not measured, not a CFD result"));
-	Lines.Add(TEXT("Paths: drawn from diffuser / grille positions, throw patterns and design airflow"));
+	const ATwinAirflowActor* A = D->AirflowActor;
+	const FString Driver = A ? A->Driver() : FString();
 	const FTwinTelemetry& T = D->Telemetry;
-	Lines.Add(T.Source.IsEmpty() || T.Source == TEXT("unavailable")
-		          ? FString(TEXT("Colour: no temperature data (grey)"))
-		          : FString::Printf(TEXT("Colour: supply -> return air temperature from %s"), *T.Label));
+	FString Mist = Driver == TEXT("feed")     ? FString::Printf(TEXT("Mist: air temperature + cooling jet of each running unit, from %s"), *T.Label)
+	             : Driver == TEXT("matlab")   ? FString(TEXT("Mist: west / east zone temperatures of the MATLAB thermal model (simulation)"))
+	             : Driver == TEXT("waiting")  ? FString(TEXT("Mist: waiting for the HVAC feed"))
+	                                          : FString(TEXT("Mist: no temperature data (tracers only)"));
+	if (A && !A->IsMistShown())
+	{
+		Mist += TEXT("  [hidden, T shows it]");
+	}
+	Lines.Add(Mist);
+	Lines.Add(TEXT("Tracers: circulation loops from each unit's outlet (drawing positions, not a flow solution)"));
 	if (D->Airflow.IsValid())
 	{
 		const TSharedPtr<FJsonObject>* Th = nullptr;
@@ -214,11 +227,11 @@ void ATwinHUD::DrawAirflowBanner(ATwinViewerDirector* D)
 	const float H = Panel(X, 18.f, W, Lines, Amber);
 	// legend
 	const float LY = 18.f + H + 6.f;
-	const float Steps[] = {12.f, 15.f, 18.f, 21.f, 24.f, 27.f, 30.f};
+	const float Steps[] = {12.f, 16.f, 20.f, 24.f, 28.f, 32.f, 36.f};
 	const float SW = W / UE_ARRAY_COUNT(Steps);
 	for (int32 i = 0; i < UE_ARRAY_COUNT(Steps); ++i)
 	{
-		DrawRect(ATwinAirflowActor::TemperatureColor(Steps[i]), X + i * SW, LY, SW, 14.f);
+		DrawRect(ATwinAirflowActor::HeatColor(Steps[i] + 2.f), X + i * SW, LY, SW, 14.f);
 		DrawText(FString::Printf(TEXT("%.0f %s"), Steps[i], Deg), FLinearColor::White, X + i * SW + 4.f, LY + 16.f, GEngine->GetSmallFont());
 	}
 }
@@ -404,10 +417,19 @@ void ATwinHUD::DrawHUD()
 		};
 		if (D)
 		{
-			Help.Add(TEXT("V airflow illustration | B switch building | Ctrl+V paste launch code"));
+			Help.Add(PC->bStreaming ? TEXT("V airflow illustration (T mist) | B switch building")
+			                        : TEXT("V airflow illustration (T mist) | B switch building | Ctrl+V paste launch code"));
 		}
-		Help.Add(TEXT("P screenshot | H hide help | Esc quit"));
+		Help.Add(PC->bStreaming ? TEXT("H hide help | click the view to steer, Esc frees the mouse")
+		                        : TEXT("P screenshot | H hide help | Esc quit"));
 		Panel(18.f, Canvas->ClipY - 36.f - Help.Num() * 22.f, 600.f, Help, Blue);
+	}
+	const double IdleLeft = PC->IdleSecondsLeft();
+	if (IdleLeft >= 0.0 && IdleLeft < 60.0)   // streamed session about to close for lack of input
+	{
+		Panel(CX - 260.f, Canvas->ClipY * 0.5f - 20.f, 520.f,
+		      {FString::Printf(TEXT("No input for a while: this session closes in %d s. Move the mouse to stay."),
+		                       FMath::CeilToInt(IdleLeft))}, Blue);
 	}
 	if (!PC->Status.IsEmpty() && GetWorld()->GetTimeSeconds() < PC->StatusUntil)
 	{

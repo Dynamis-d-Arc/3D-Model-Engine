@@ -74,10 +74,13 @@ class Storage:
         self._lock = threading.RLock()
         with self.conn() as c:
             c.executescript(SCHEMA)
-            cols = {r["name"] for r in c.execute("PRAGMA table_info(ai_calls)").fetchall()}
-            for col, typ in (("cost_usd", "REAL"), ("purpose", "TEXT")):  # migrate older databases
-                if col not in cols:
-                    c.execute(f"ALTER TABLE ai_calls ADD COLUMN {col} {typ}")
+            for table, add in (("ai_calls", (("cost_usd", "REAL"), ("purpose", "TEXT"))),   # migrate older databases
+                               ("builds", (("kind", "TEXT NOT NULL DEFAULT 'full'"),)),
+                               ("versions", (("changes_json", "TEXT"),))):
+                cols = {r["name"] for r in c.execute(f"PRAGMA table_info({table})").fetchall()}
+                for col, typ in add:
+                    if col not in cols:
+                        c.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
 
     @contextmanager
     def conn(self) -> Iterator[sqlite3.Connection]:
@@ -184,7 +187,7 @@ class Storage:
 
     # ---- versions (immutable) ----------------------------------------------------------------
     def add_version(self, pid: str, scene: Scene, *, source: str, note: str, parent: int | None,
-                    validation: dict, scene_hash: str) -> dict:
+                    validation: dict, scene_hash: str, changes: dict | None = None) -> dict:
         with self.conn() as c:
             row = c.execute("SELECT MAX(number) AS n FROM versions WHERE project_id=?", (pid,)).fetchone()
             number = (row["n"] or 0) + 1
@@ -195,8 +198,10 @@ class Storage:
             tmp = path.with_suffix(".tmp")
             tmp.write_text(scene.model_dump_json(indent=1), encoding="utf-8")
             tmp.replace(path)
-            c.execute("INSERT INTO versions VALUES (?,?,?,?,?,?,?,?)",
-                      (pid, number, source, note[:1000], parent, scene_hash, json.dumps(validation), time.time()))
+            c.execute("INSERT INTO versions (project_id, number, source, note, parent, scene_hash, validation_json, "
+                      "created_at, changes_json) VALUES (?,?,?,?,?,?,?,?,?)",
+                      (pid, number, source, note[:1000], parent, scene_hash, json.dumps(validation), time.time(),
+                       json.dumps(changes) if changes is not None else None))
             c.execute("UPDATE projects SET updated_at=?, status=? WHERE id=?",
                       (time.time(), "ready" if validation.get("can_generate") else "needs_review", pid))
         return self.get_version_meta(pid, number)
@@ -208,17 +213,21 @@ class Storage:
             raise NotFound(f"{pid} v{number}")
         d = dict(row)
         d["validation"] = json.loads(d.pop("validation_json"))
+        raw = d.pop("changes_json", None)
+        d["changes"] = json.loads(raw) if raw else None
         return d
 
     def list_versions(self, pid: str) -> list[dict]:
         with self.conn() as c:
-            rows = c.execute("SELECT project_id, number, source, note, parent, scene_hash, created_at, validation_json "
-                             "FROM versions WHERE project_id=? ORDER BY number DESC", (pid,)).fetchall()
+            rows = c.execute("SELECT project_id, number, source, note, parent, scene_hash, created_at, validation_json, "
+                             "changes_json FROM versions WHERE project_id=? ORDER BY number DESC", (pid,)).fetchall()
         out = []
         for r in rows:
             d = dict(r)
             v = json.loads(d.pop("validation_json"))
+            raw = d.pop("changes_json")
             d["can_generate"], d["counts"] = v.get("can_generate"), v.get("counts", {})
+            d["changes"] = json.loads(raw) if raw else None
             out.append(d)
         return out
 
@@ -280,11 +289,14 @@ class Storage:
             return cur.rowcount
 
     # ---- builds -----------------------------------------------------------------------------
-    def create_build(self, pid: str, version: int, job_id: str, previous: str | None) -> dict:
+    def create_build(self, pid: str, version: int, job_id: str, previous: str | None, kind: str = "full") -> dict:
+        """kind 'full' = Blender generates the model (previous = build whose unchanged exports are reused);
+        'layer' = the saved build ``previous`` is reused as is and only its layers are rewritten."""
         bid = f"b_{time.strftime('%Y%m%d_%H%M%S')}_{secrets.token_hex(3)}"
         with self.conn() as c:
-            c.execute("INSERT INTO builds VALUES (?,?,?,?,?,?,?,?,?)",
-                      (bid, pid, version, job_id, "queued", previous, time.time(), None, None))
+            c.execute("INSERT INTO builds (id, project_id, version, job_id, status, previous_build, created_at, "
+                      "finished_at, summary_json, kind) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                      (bid, pid, version, job_id, "queued", previous, time.time(), None, None, kind))
         return self.get_build(pid, bid)
 
     def update_build(self, bid: str, *, status: str, summary: dict | None = None) -> None:

@@ -13,7 +13,9 @@ public class TwinWalkthrough : ModuleRules
 		// PNG/JPEG textures, clipboard launch codes
 		PrivateDependencyModuleNames.AddRange(new string[]
 		{
-			"HTTP", "ProceduralMeshComponent", "ImageWrapper", "ApplicationCore"
+			"HTTP", "ProceduralMeshComponent", "ImageWrapper", "ApplicationCore",
+			// streaming mode: a Slate input pre-processor reads the mouse look (see FTwinMouseDeltaProcessor)
+			"Slate", "SlateCore"
 		});
 		if (Target.bBuildEditor)
 		{

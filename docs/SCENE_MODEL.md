@@ -37,6 +37,7 @@ These are covered by `tests/test_transforms.py` and verified inside Unreal by th
 | `furniture[]` | id, asset_id (catalog), room_id, position, elevation (omitted = the asset's `default_elevation`, e.g. 2.0 m for an exhaust hood), rotation_deg, size (null = catalog), materials {role: material}, label |
 | `materials[]` | id, base_color (#RRGGBB sRGB), roughness, metallic, pattern, tile_size (m), opacity, emission, palette (extra colours), joint_color (grout/joints/holes) |
 | `lighting` | mood, ceiling_lights, sun azimuth/elevation/strength |
+| `sensors[]` | id, tag, kind, level_id, room_id, position, elevation, mounting wall/ceiling/free, unit_id, bms_point, label — a layer: changing it never changes the building, see [SENSORS.md](SENSORS.md) |
 | `open_questions[]` | questions from the AI with severity and the user's answer |
 | `provenance` | source (`user`/`ai`/`fixture`/`derived`/`manual`), AI model, request id |
 

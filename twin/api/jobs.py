@@ -20,9 +20,10 @@ from twin.pipeline import BuildFailed
 
 log = logging.getLogger("twin.jobs")
 
-POOLS = {"ai": 2, "blender": 1, "unreal": 1, "hvac": 1}
+POOLS = {"ai": 2, "blender": 1, "unreal": 1, "hvac": 1, "layer": 2}
+# layer builds (sensor updates of a saved model) never wait behind a Blender build
 KIND_POOL = {"interpret": "ai", "redesign": "ai", "fix": "ai", "furniture": "ai", "build": "blender", "unreal_import": "unreal",
-             "hvac_import": "hvac"}
+             "hvac_import": "hvac", "layer_build": "layer"}
 
 
 @dataclass

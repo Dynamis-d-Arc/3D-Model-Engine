@@ -28,6 +28,8 @@ verification.
 | 3 Unreal | C++ walkthrough template (walk/fly/ghost, collision, nav mesh, click-to-walk, room teleport, selection + info HUD, ceilings toggle, scripted verification tour), headless import with hash-based mesh reuse and in-engine bounds verification | real UE 5.8.3 tests: 66 actors within 0.0001 cm, mesh reuse on re-import, every room reachable on the nav mesh, click-to-walk, wall collision, selection, screenshots |
 | AI | OpenAI-compatible client (Responses or Chat Completions), strict JSON schema, retries/timeouts, typed errors, usage log + daily limit, plan interpretation, single-room redesign, probe CLI | mocked HTTP tests; live test is opt-in once the key is set |
 | HVAC | HVAC drawing (vector PDF) → aligned on the structural grid → OCR + symbol detection → fan-coil units, diffusers, grilles and ducts placed, linked and built in 3D; **Fix with AI** (plain-language corrections → validated edit operations → new version); **Live HVAC** tab: an airflow illustration (one zone per AC unit) driven by MATLAB thermal results or live / simulated BMS data | synthetic detection/registration tests, airflow illustration tests in Node, mocked AI fix, API tests, optional private-drawing regression (`realdata`, tests/local) — see [docs/HVAC.md](docs/HVAC.md) |
+| Sensors | Sensor layer (temperature, humidity, CO2, pressure, occupancy, …): place on the plan or import a CSV placement sheet, validation, linked HVAC unit + BMS point; **update the saved 3D model in place** — the Blender build is reused byte for byte and only the sensors are written on top (seconds, no Blender); version change summaries, restore; live / simulated readings in the Live tab; sensors in the packaged Unreal viewer | unit + API tests without Blender, real Blender build tests, browser flow — see [docs/SENSORS.md](docs/SENSORS.md) |
+| Browser walkthrough | **Open in browser (Unreal)**: the packaged viewer streamed into the web app with Pixel Streaming 2 (local test: viewer + signalling server on this PC, 127.0.0.1 only); per-session build-scoped token kept on the server, idle / max-length session end | session manager tests with a stand-in viewer, loopback-binding test, manual stream check in headless Edge — see [docs/PIXEL_STREAMING.md](docs/PIXEL_STREAMING.md) |
 | 4–5 | Not started (multi-floor, stairs, accounts, deployment). See docs/OPERATIONS.md | – |
 
 ## Quick start (Windows)
@@ -90,7 +92,9 @@ on a completed build, or see [docs/UNREAL.md](docs/UNREAL.md) for manual steps.
    estimates, generate; **Live HVAC** shows the airflow simulation driven by live or simulated unit data.
 6. Anything wrong? **Fix with AI** in Review (or on a picked 3D object) describes the problem in words and
    gets a corrected version to review.
-5. Change one room (manually or **Redesign with AI**) → new version → regenerate: unchanged exports
+7. Add sensors later (**+ Sensor** in Review, or **Import sheet (CSV)**) → save → **Update the 3D model**: the
+   saved build is reused as it is and only the sensor layer is added, no regeneration (docs/SENSORS.md).
+8. Change one room (manually or **Redesign with AI**) → new version → regenerate: unchanged exports
    are reused, and the Unreal importer re-imports only meshes whose content hash changed.
 
 ## Commands
@@ -115,3 +119,5 @@ on a completed build, or see [docs/UNREAL.md](docs/UNREAL.md) for manual steps.
 - [docs/TESTING.md](docs/TESTING.md) – automated vs mocked vs real integration tests
 - [docs/OPERATIONS.md](docs/OPERATIONS.md) – running, security, data, roadmap to a service
 - [docs/HVAC.md](docs/HVAC.md) – HVAC drawing import, Fix with AI, live data API, airflow simulation
+- [docs/SENSORS.md](docs/SENSORS.md) – the build-once / update-in-place flow, sensor model, layer builds, CSV sheet, API
+- [docs/PIXEL_STREAMING.md](docs/PIXEL_STREAMING.md) – the Unreal walkthrough streamed into the browser (local test), security model, hosting plan and costs

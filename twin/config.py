@@ -124,6 +124,35 @@ class Settings:
     viewer_secret: SecretStr | None = None
     viewer_token_ttl_h: float = 12.0
     public_url: str | None = None
+    stream: "StreamSettings | None" = None
+
+
+@dataclass(frozen=True)
+class StreamSettings:
+    """Local Pixel Streaming test (twin/stream): the packaged viewer streamed into the web app from this PC."""
+
+    enabled: bool                      # TWIN_STREAM_LOCAL=1
+    viewer_exe: Path                   # streaming-enabled package (python -m twin.unreal.package --out dist/TwinViewerStreaming)
+    signalling_dir: Path | None        # Epic's SignallingWebServer folder (built), PixelStreamingInfrastructure UE5.8
+    node: str | None
+    player_port: int = 8090
+    streamer_port: int = 8888
+    max_sessions: int = 2
+    res_x: int = 1600
+    res_y: int = 900
+    idle_exit_s: int = 600
+    max_session_s: int = 3600
+
+    def problems(self) -> list[str]:
+        out = []
+        if not self.viewer_exe.is_file():
+            out.append(f"streaming viewer not packaged ({self.viewer_exe.name} missing; "
+                       "run python -m twin.unreal.package --out dist/TwinViewerStreaming)")
+        if not self.signalling_dir or not (self.signalling_dir / "dist" / "index.js").is_file():
+            out.append("signalling server not found (set TWIN_STREAM_SIGNALLING_DIR to a built SignallingWebServer folder)")
+        if not self.node:
+            out.append("Node.js not found")
+        return out
 
 
 def load_settings(env: dict[str, str] | None = None, env_file: Path | None = ENV_FILE) -> Settings:
@@ -165,6 +194,22 @@ def load_settings(env: dict[str, str] | None = None, env_file: Path | None = ENV
         viewer_secret=SecretStr(v) if (v := _lookup(env, fv, "TWIN_VIEWER_SECRET")) else None,
         viewer_token_ttl_h=float(_lookup(env, fv, "TWIN_VIEWER_TOKEN_TTL_H", default="12")),
         public_url=(_lookup(env, fv, "TWIN_PUBLIC_URL") or "").rstrip("/") or None,
+        stream=StreamSettings(
+            enabled=_lookup(env, fv, "TWIN_STREAM_LOCAL", default="0") in ("1", "true", "yes"),
+            # the game binary itself, not the Windows/TwinWalkthrough.exe launcher stub (which would outlive a stop)
+            viewer_exe=Path(_lookup(env, fv, "TWIN_STREAM_VIEWER_EXE", default=str(
+                PROJECT_ROOT / "dist" / "TwinViewerStreaming" / "Windows" / "TwinWalkthrough" / "Binaries" / "Win64"
+                / "TwinWalkthrough.exe"))),
+            signalling_dir=Path(v) if (v := _lookup(env, fv, "TWIN_STREAM_SIGNALLING_DIR")) else None,
+            node=_lookup(env, fv, "TWIN_STREAM_NODE") or shutil.which("node"),
+            player_port=int(_lookup(env, fv, "TWIN_STREAM_PLAYER_PORT", default="8090")),
+            streamer_port=int(_lookup(env, fv, "TWIN_STREAM_STREAMER_PORT", default="8888")),
+            max_sessions=int(_lookup(env, fv, "TWIN_STREAM_MAX_SESSIONS", default="2")),
+            res_x=int(_lookup(env, fv, "TWIN_STREAM_RES_X", default="1600")),
+            res_y=int(_lookup(env, fv, "TWIN_STREAM_RES_Y", default="900")),
+            idle_exit_s=int(_lookup(env, fv, "TWIN_STREAM_IDLE_EXIT_S", default="600")),
+            max_session_s=int(_lookup(env, fv, "TWIN_STREAM_MAX_SESSION_S", default="3600")),
+        ),
     )
 
 

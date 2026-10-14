@@ -61,7 +61,8 @@ Open a building
 Controls
   WASD move, mouse look, Shift run, Space jump, F fly, G ghost (through walls), C ceilings on/off
   Left click select (furniture / HVAC details), right click walk there, Tab or 1-9 or M (list) rooms
-  V airflow illustration (schematic, not measured, not CFD), B switch building, P screenshot, Esc quit
+  V airflow illustration (schematic, not measured, not CFD), T its temperature mist, B switch building,
+  P screenshot, Esc quit
 
 Data
   The model is downloaded from the backend and cached in TwinWalkthrough\\Saved\\TwinCache (delete freely).

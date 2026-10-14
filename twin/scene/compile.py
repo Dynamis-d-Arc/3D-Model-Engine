@@ -385,6 +385,10 @@ def compile_scene(scene: Scene) -> dict:
     reviewed = [f"{kind}:{el.id}" for kind, coll in (("room", scene.rooms), ("wall", scene.walls),
                                                       ("opening", scene.openings), ("furniture", scene.furniture))
                 for el in coll if el.certainty.status == "accepted_estimate"]
+    # the sensor layer is kept apart from the building: Blender never builds it, twin.layers writes it on top
+    from twin.scene.sensors import compile_sensors
+    sensors, sensor_mats = compile_sensors(scene)
+    reviewed += [f"sensor:{s.id}" for s in scene.sensors if s.certainty.status == "accepted_estimate"]
     return {
         "plan_version": PLAN_VERSION,
         "library_version": LIBRARY_VERSION,
@@ -402,6 +406,8 @@ def compile_scene(scene: Scene) -> dict:
         "cameras": cameras,
         "rooms": rooms_out,
         "openings": openings_out,
+        "sensors": sensors,
+        "sensor_materials": sensor_mats,
         "accepted_estimates": reviewed,
     }
 
