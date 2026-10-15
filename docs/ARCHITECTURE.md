@@ -57,7 +57,12 @@ projects/<p_id>/versions/vNNNN.json immutable scene versions
 projects/<p_id>/builds/<b_id>/      plan.json, scene.json, scene.blend, export/…, preview/…,
                                     export/web/geometry.glb (Blender) + scene.glb (+ layers), sensors.json,
                                     blender_report.json, verify_report.json, layer_report.json, manifest.json, unreal/…
+trash/                              folders being deleted (emptied at every start)
 ```
+
+Deleting (`DELETE /api/projects/{p}/files/{f}`, `DELETE /api/projects/{p}`) first moves the folder into
+`trash/` in one rename, then removes the database rows, then the folder. While another program has a file
+in it open the rename fails on Windows, so the request answers `FILES_IN_USE` and nothing is deleted.
 
 Builds belong to one project version and live in their own directory, so a later build never touches
 an earlier one. `builds.kind` is `full` (Blender) or `layer` (a saved build reused with new layers;

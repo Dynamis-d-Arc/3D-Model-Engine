@@ -3,7 +3,7 @@
 import { api, get, post } from "./api.js";
 import { refreshProject, switchTab, watchJob } from "./app.js";
 import { state, on, emit } from "./state.js";
-import { h, mount, toast, showError, badge, fmtBytes, fmtTime, fmtM, ask, confirmDialog } from "./ui.js";
+import { h, mount, toast, showError, badge, fmtBytes, fmtTime, fmtWhen, fmtM, ask, confirmDialog, jobProgress } from "./ui.js";
 
 let root;
 let viewer = null;
@@ -19,9 +19,13 @@ export function renderGenerate(el) {
   on("tab", (t) => { if (t === "generate") draw(); });
 }
 
+const SOURCE_NAMES = { ai: "AI reading", ai_fix: "AI change", ai_furniture: "AI furniture", ai_redesign: "AI redesign",
+  auto_fix: "auto-fixed", fixture: "sample", hvac: "HVAC import", hvac_import: "HVAC import", manual: "drawn by hand",
+  edit: "edited", derive: "walls rebuilt" };
+
 function versionOptions() {
   return state.project.versions.map((v) => h("option", { value: v.number, selected: v.number === state.version },
-    `v${v.number} · ${v.source} · ${v.can_generate ? "ready" : "needs review"}`));
+    `v${v.number} — ${SOURCE_NAMES[v.source] || v.source.replace(/_/g, " ")} · ${v.can_generate ? "ready to build" : "needs review"}`));
 }
 
 async function startBuild(number, render, reuse, mode = "full") {
@@ -52,9 +56,7 @@ function drawProgress() {
   if (!progressEl) return;
   const j = activeJob;
   if (!j) return mount(progressEl);
-  const pct = Math.round((j.progress || 0) * 100);
-  mount(progressEl, h("div.card", null, h("div.row", null, h("b", null, j.layer ? "Updating the saved model" : "Generating"), badge(j.status), h("span.small", null, j.stage),
-    h("span.spacer"), h("span.small.muted", null, `${pct}%`)), h("div.progress", { style: { marginTop: "8px" } }, h("div", { style: { width: `${pct}%` } }))));
+  mount(progressEl, h("div.card", null, jobProgress(j, { title: j.layer ? "Updating the saved model" : "Generating" })));
 }
 
 async function loadBuild(bid) {
@@ -70,62 +72,70 @@ async function draw() {
     return mount(root, h("div.card", null, h("h2", null, "Nothing to generate yet"), h("p", null, "Create and review a layout first."),
       h("button.btn", { onclick: () => switchTab("brief") }, "← Brief")));
   }
-  const verSel = h("select", null, versionOptions());
+  const verSel = h("select", { "aria-label": "Layout version" }, versionOptions());
   const renderCb = h("input", { type: "checkbox", checked: true });
   const reuseCb = h("input", { type: "checkbox", checked: true });
   const vmeta = () => p.versions.find((v) => v.number === Number(verSel.value));
-  const ready = h("div");
-  const actions = h("div");
-  const fullBtn = (primary) => h("button.btn" + (primary ? ".primary" : ""), { disabled: !!activeJob || !vmeta().can_generate,
-    onclick: () => startBuild(Number(verSel.value), renderCb.checked, reuseCb.checked, "full") }, primary ? "Generate" : "Regenerate everything (Blender)");
-  const fullNote = h("span.small.muted", null, "Blender builds the scene, saves the .blend, exports FBX/GLB, then re-imports every export to verify it.");
+  const status = h("div");
+  const rebuild = h("div");
+  const build = (mode) => startBuild(Number(verSel.value), mode === "layer" ? false : renderCb.checked, mode === "layer" || reuseCb.checked, mode);
+  const fullBtn = (primary) => h("button.btn" + (primary ? ".primary" : ".small"), { disabled: !!activeJob || !vmeta().can_generate,
+    onclick: () => build("full") }, primary ? "Build 3D model" : "Rebuild everything (Blender)");
+  // where the chosen version stands, and the one thing to do about it
+  const panel = (kind, icon, head, sub, ...buttons) => h(`div.notice.build-status${kind ? "." + kind : ""}`, null,
+    h("div.bs-head", null, h("span.bs-icon", null, icon), head), sub ? h("div.bs-sub", null, sub) : null,
+    buttons.filter(Boolean).length ? h("div.row.bs-actions", null, buttons) : null);
   const updReady = async () => {
     const v = vmeta();
-    mount(ready, v.can_generate ? null
-      : h("div.notice.warn", null, "This version has errors or unconfirmed measurements. ",
-        h("a", { href: "#", onclick: (e) => { e.preventDefault(); state.version = v.number; switchTab("review"); } }, "Review it"), " before generating."));
-    mount(actions, h("div.row", null, fullBtn(true), fullNote));
-    if (!v.can_generate) return;
+    mount(rebuild);
+    if (!v.can_generate) {
+      return mount(status, panel("warn", "!", `v${v.number} needs review first`, "It has problems or measurements to confirm.",
+        h("button.btn.small", { onclick: () => { state.version = v.number; switchTab("review"); } }, "Review it →")));
+    }
+    mount(status, panel("", "▸", `v${v.number} is ready to build`, "Blender builds the 3D model and checks every export.", fullBtn(true)));
     let opts;
     try { opts = await get(`/api/projects/${p.id}/versions/${v.number}/build-options`); } catch { return; }
     if (Number(verSel.value) !== v.number) return;
     const L = opts.layer;
     if (L.possible && L.up_to_date) {
-      mount(ready, h("div.notice.ok", null, `Build ${L.base_build.id.slice(2)} already shows v${v.number}.`));
-      mount(actions, h("div.row", null, h("button.btn", { onclick: () => { state.buildId = L.base_build.id; draw(); } }, "Open it"), fullBtn(false)));
+      const b = p.builds.find((x) => x.id === L.base_build.id) || L.base_build;
+      const info = h("div");
+      const when = fmtWhen(b.finished_at || b.created_at).replace(/^(Today|Yesterday)/, (w) => w.toLowerCase());
+      mount(status, h("div", null, panel("ok", "✓", `v${v.number} is built`, `Built ${when}`,
+        b.id !== state.buildId ? h("button.btn.small", { onclick: () => { state.buildId = b.id; draw(); } }, "Show it") : null,
+        unrealButton(b, info, "button.btn.primary.small")), info));
+      mount(rebuild, fullBtn(false));
     } else if (L.possible) {
       const c = L.changes;
       const what = [c.added.length && `${c.added.length} added`, c.moved.length && `${c.moved.length} moved`, c.edited.length && `${c.edited.length} edited`,
         c.removed.length && `${c.removed.length} removed`].filter(Boolean).join(", ") || "no sensor changes";
-      mount(ready, h("div.notice.ok", null,
-        h("div", null, h("b", null, "Only the sensor layer changed "), `since the saved model (build ${L.base_build.id.slice(2)} · v${L.base_build.version}): ${what}.`),
-        h("div.small", null, "The saved building — walls, HVAC, furniture, materials — is reused byte for byte; only the sensors are written on top. No Blender run.")));
-      mount(actions, h("div.row", null,
-        h("button.btn.primary", { disabled: !!activeJob, onclick: () => startBuild(v.number, false, true, "layer") }, "Update saved model"),
-        fullBtn(false)));
-    } else {
-      mount(ready, h("div.notice", null, opts.saved_builds ? L.reason : "This version passed validation. Generate the building once; later sensor changes then update this saved model in place."));
+      mount(status, panel("ok", "↻", "Only the sensors changed",
+        `Since the saved model (v${L.base_build.version}): ${what}. The building is reused as it is, so this takes seconds, no Blender.`,
+        h("button.btn.primary.small", { disabled: !!activeJob, onclick: () => build("layer") }, "Update saved model")));
+      mount(rebuild, fullBtn(false));
+    } else if (opts.saved_builds) {
+      mount(status, panel("", "▸", `v${v.number} is ready to build`, L.reason, fullBtn(true)));
     }
   };
   verSel.addEventListener("change", updReady);
   updReady();
   progressEl = h("div");
-  const controls = h("div.card", null, h("h2", null, "Generate 3D scene"),
-    h("div.row", null, h("label.field", null, "Scene version", verSel),
-      h("label.small", null, renderCb, " render preview images"), h("label.small", null, reuseCb, " reuse unchanged exports from the last build")),
-    h("div.row", null, ready), actions);
+  const controls = h("div.card", null, h("h2", null, "3D model"),
+    h("label.field", null, "Layout version", verSel),
+    status,
+    h("details.build-opts", null, h("summary", null, "Build options"),
+      h("label.small", null, renderCb, " Render preview images"),
+      h("label.small", null, reuseCb, " Reuse unchanged exports from the last build (faster)"),
+      rebuild));
 
   const builds = p.builds;
   const list = h("div.card", null, h("h2", null, "Builds"),
-    builds.length ? h("table.simple", null, h("thead", null, h("tr", null, h("th", null, "Build"), h("th", null, "Version"), h("th", null, "Status"), h("th", null, "Finished"), h("th"))),
-      h("tbody", null, builds.map((b) => h("tr", { style: { background: b.id === state.buildId ? "#eef3f8" : "" } },
-        h("td.mono", null, b.id.slice(2), h("div", null, b.kind === "layer"
-          ? h("span.kind-tag", { title: `sensor layer updated on the saved model of build ${b.previous_build}` }, `sensor update ← ${b.previous_build.slice(-6)}`)
-          : h("span.kind-tag.full", { title: "generated by Blender" }, "Blender"))),
-        h("td", null, `v${b.version}`),
-        h("td", null, badge(b.status)),
-        h("td.small", null, fmtTime(b.finished_at)),
-        h("td", null, h("button.btn.small", { onclick: () => { state.buildId = b.id; draw(); } }, "Open"))))))
+    builds.length ? h("ul.build-list", null, builds.map((b) => h("li.build-item" + (b.id === state.buildId ? ".current" : ""),
+      { onclick: () => { state.buildId = b.id; draw(); }, title: `Build ${b.id}` + (b.kind === "layer" ? ` — sensors updated on build ${b.previous_build}` : "") },
+      h("span.bi-ver", null, `v${b.version}`),
+      h("span.bi-main", null, h("span", null, b.kind === "layer" ? "Sensor update" : "Blender build"),
+        b.status !== "completed" ? badge(b.status) : null, h("span.bi-id", null, `#${b.id.slice(-6)}`)),
+      h("span.bi-when", null, b.id === state.buildId ? h("span.bi-showing", null, "Showing") : fmtWhen(b.finished_at || b.created_at)))))
       : h("p.muted", null, "No builds yet."));
 
   const detail = h("div");
@@ -187,15 +197,18 @@ async function drawBuild(el, bid) {
     ` in ${m.timings?.total_s ?? "?"} s, placement checked within ${v.layer_max_deviation_cm != null ? (v.layer_max_deviation_cm * 10).toFixed(3) : "?"} mm.`) : null;
   const st = state.health?.streaming;
   streamEl = h("div");
+  const unrealInfo = h("div");
   mount(el, streamEl,
     h("div.card", null, h("div.row", null, h("h2", { style: { margin: 0 } }, `Build ${bid.slice(2)} · scene v${b.version}`), badge("completed"),
       isLayer ? h("span.kind-tag", null, "sensor update") : null,
       h("span.spacer"),
+      unrealButton(b, unrealInfo, "button.btn.small.primary"),
       st?.enabled ? h("button.btn.small.primary", { id: "streamBtn", disabled: !st.available || (stream && stream.session.state !== "ended"),
         title: st.available ? "Walk through this build in Unreal Engine, streamed into this page (Pixel Streaming)" : st.problems.join("; "),
         onclick: () => startStream(b) }, "Open in browser (Unreal)") : null,
       h("span.small.muted", null, `${m.blender} · ${fmtTime(b.finished_at)}`)),
-      h("div.small", { style: { margin: "8px 0" } }, `${m.rooms.length} rooms · ${m.objects.length} architectural objects · ${m.furniture.length} furniture items · ${sensors.length} sensors · `,
+      unrealInfo,
+      h("div.small", { style: { margin: "8px 0" } }, `${m.rooms.length} rooms ·${m.objects.length} architectural objects · ${m.furniture.length} furniture items · ${sensors.length} sensors · `,
         `${v.files_checked} exported files re-imported and checked, max deviation ${(v.max_reimport_delta_m * 1000).toFixed(3)} mm (tolerance ${v.tolerance_m * 1000} mm)`,
         m.reused_exports.length ? ` · ${m.reused_exports.length} unchanged exports reused` : ""),
       layerLine,
@@ -381,15 +394,24 @@ async function deliverLaunch(info, r, copy, what) {
     copy ? "Paste it into the viewer with Ctrl+V." : h("span", null, "Open it with ", h("code", null, `"Open Twin Viewer.cmd" "${r.file_name}"`), ".")));
 }
 
-/** "Open on this PC": the backend starts the packaged viewer on this computer (browser + server on the same PC). */
+/** "View in Unreal Engine": the backend starts the packaged viewer on this computer (browser + server on the same PC). */
 async function openHere(info, url, body, what) {
   try {
     const r = await post(url, body);
     if (!r.started) return toast("The viewer is already opening.", "info", 4000);
-    toast(`Opening ${what} in the Unreal viewer… (a few seconds)`, "ok", 6000);
+    toast(`Opening ${what} in Unreal Engine… (a few seconds)`, "ok", 6000);
     mount(info, h("div.notice.ok", null, `The Unreal viewer (${r.viewer}) is starting on this PC with ${what}. `,
       "H shows the controls; Esc quits."));
-  } catch (e) { showError(e, "Open on this PC"); }
+  } catch (e) { showError(e, "View in Unreal Engine"); }
+}
+
+/** One click: this build opens in the packaged Unreal viewer on this PC. Greyed out (with the reason) until it is set up. */
+function unrealButton(b, info, tag = "button.btn.primary") {
+  const dv = state.health?.desktop_viewer;
+  return h(tag, { disabled: !dv?.available,
+    title: dv?.available ? "Walk through this build in Unreal Engine on this PC" : `Not set up yet: ${dv?.problem || "no packaged viewer"}`,
+    onclick: () => openHere(info, `/api/projects/${state.project.id}/viewer/open-local`, { build_id: b.id }, "this build") },
+  "View in Unreal Engine");
 }
 
 /** Desktop viewer: a short-lived read-only link the packaged Unreal app opens (no editor needed anywhere). */
@@ -407,10 +429,11 @@ function viewerSection(b) {
       "furniture and HVAC details with live data, airflow illustration. The viewing PC needs no Unreal Editor or Blender; ",
       "the link holds a short-lived read-only token, never an API key."),
     h("div.row", null,
-      here ? h("button.btn.primary", { onclick: () => openHere(info, `/api/projects/${state.project.id}/viewer/open-local`, { build_id: b.id }, "this build") },
-        "Open on this PC") : null,
+      here ? unrealButton(b, info) : null,
       h(here ? "button.btn" : "button.btn.primary", { onclick: () => launch(false) }, here ? "Download launch file" : "Open in desktop viewer"),
       h("button.btn", { onclick: () => launch(true) }, "Copy launch code")),
+    here ? null : h("p.small.muted", null, "“View in Unreal Engine” on this PC needs the viewer packaged once (developer machine with UE 5.8): ",
+      h("code", null, ".venv/Scripts/python.exe -m twin.unreal.package --config Shipping --out dist/TwinViewerShipping")),
     info,
     stacksSection());
 }
@@ -482,7 +505,7 @@ function stacksSection() {
       st.plan_error ? h("div.notice.warn", null, st.plan_error.message) : null,
       h("div.row", null,
         here ? h("button.btn.primary", { disabled: !!st.plan_error,
-          onclick: () => openHere(info, `/api/stacks/${st.id}/viewer/open-local`, {}, `${st.name} (${st.floors.length} floors)`) }, "Open on this PC") : null,
+          onclick: () => openHere(info, `/api/stacks/${st.id}/viewer/open-local`, {}, `${st.name} (${st.floors.length} floors)`) }, "View in Unreal Engine") : null,
         h(here ? "button.btn" : "button.btn.primary", { disabled: !!st.plan_error, onclick: () => launch(st, false) },
           here ? "Download launch file" : "Open in desktop viewer"),
         h("button.btn", { disabled: !!st.plan_error, onclick: () => launch(st, true) }, "Copy launch code"),

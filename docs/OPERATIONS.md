@@ -23,6 +23,13 @@
   `POST /api/projects/{p}/viewer/launch` is as open as the rest of the web API until accounts exist —
   keep the loopback binding or put the backend behind authentication before exposing it.
 * Builds/jobs never delete user data; versions and builds are append-only.
+* Only the user deletes, from the web app: one upload (the × on its thumbnail in Brief & files,
+  `DELETE /api/projects/{p}/files/{f}`; saved versions and builds are kept) or a whole project with its files,
+  versions, jobs and builds (Delete project in the header, `DELETE /api/projects/{p}`). Both are refused while
+  a job of the project runs (`PROJECT_BUSY`) or one of its files is open in another program (`FILES_IN_USE`);
+  a floor of a multi-floor building must be taken out of the building first (`PROJECT_IN_BUILDING`).
+  AI call records stay so the spending cap still counts them, and meshes already imported into the Unreal
+  walkthrough project (`/Game/Twins/<project>`) are left there.
 
 ## Roadmap to a service (stages 4–5, not implemented)
 

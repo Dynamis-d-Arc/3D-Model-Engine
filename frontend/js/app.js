@@ -1,7 +1,7 @@
 // @ts-check
-import { get, post } from "./api.js";
+import { del, get, post } from "./api.js";
 import { state, emit, on } from "./state.js";
-import { h, mount, ask, showError, toast } from "./ui.js";
+import { h, mount, ask, showError, toast, confirmDialog } from "./ui.js";
 import { renderBrief } from "./brief.js";
 import { renderReview } from "./editor.js";
 import { renderGenerate } from "./generate.js";
@@ -99,6 +99,29 @@ async function newProject() {
   }
 }
 
+async function deleteProject() {
+  const p = state.project;
+  if (!p) return;
+  const n = (k, one) => `${k} ${one}${k === 1 ? "" : "s"}`;
+  const ok = await confirmDialog("Delete project",
+    `Delete "${p.name}" with its ${n(p.files.length, "uploaded file")}, ${n(p.versions.length, "layout version")} and ` +
+    `${n(p.builds.length, "3D model build")}? This cannot be undone.`, "Delete project", true);
+  if (!ok) return;
+  try {
+    await del(`/api/projects/${p.id}`);
+  } catch (e) {
+    showError(e, "Could not delete project");
+    return;
+  }
+  for (const key of [`twin.plan.${p.id}`, `twin.refsOff.${p.id}`]) localStorage.removeItem(key);
+  if (localStorage.getItem("twin.project") === p.id) localStorage.removeItem("twin.project");
+  state.projects = state.projects.filter((x) => x.id !== p.id);
+  state.version = null;
+  state.buildId = null;
+  await openProject("");
+  toast(`Deleted ${p.name}`, "ok");
+}
+
 /**
  * Where the project stands and the one thing to do next (a slim bar under the tabs, plus ticks on finished steps).
  * Steps: 1 plan uploaded + layout created, 2 layout ready to build, 3 3D model built for the newest version.
@@ -132,7 +155,7 @@ function projectProgress(p) {
     msg = `The 3D model of v${v.number} is ready. Walk through it, or see the live HVAC view.`;
     action = "View in 3D"; tab = "generate"; cls = "done";
   }
-  return { msg, action, tab, done, cls };
+  return { msg, action, tab, done, cls, running: !!running, built };
 }
 
 export const JOB_LABELS = { interpret: "the AI is reading the plan", fix: "the AI is changing the layout", solve: "fixing problems",
@@ -153,13 +176,26 @@ function renderNextStep() {
   el.className = "next-step" + (st.cls ? " " + st.cls : "");
   mount(el,
     h("div.steps", null, steps.map(([t, label]) => h("span" + (st.done[t] ? ".done" : t === now ? ".now" : ""), null, (st.done[t] ? "✓ " : "") + label))),
+    st.running ? h("span.spinner", { title: "working" }) : null,
     h("div.msg", null, st.msg),
-    st.action && state.activeTab !== st.tab ? h("button.btn.primary.small", { onclick: () => switchTab(st.tab) }, st.action + " →") : null);
+    st.built && state.health?.desktop_viewer?.available
+      ? h("button.btn.primary.small", { title: "Walk through the newest 3D model in Unreal Engine on this PC", onclick: () => viewInUnreal(p, st.built) },
+        "View in Unreal Engine") : null,
+    st.action && state.activeTab !== st.tab ? h("button.btn" + (st.built ? "" : ".primary") + ".small", { onclick: () => switchTab(st.tab) }, st.action + " →") : null);
+}
+
+/** One click from anywhere: the newest built model opens in the packaged Unreal viewer on this PC. */
+async function viewInUnreal(p, build) {
+  try {
+    const r = await post(`/api/projects/${p.id}/viewer/open-local`, { build_id: build.id });
+    toast(r.started ? "Opening the 3D model in Unreal Engine… (a few seconds)" : "The Unreal viewer is already opening.", "ok", 6000);
+  } catch (e) { showError(e, "View in Unreal Engine"); }
 }
 
 function updateVisibility() {
   const has = !!state.project;
   $("emptyState").classList.toggle("hidden", has);
+  $("deleteProjectBtn").classList.toggle("hidden", !has);
   document.querySelectorAll(".tab-panel").forEach((p) => p.classList.toggle("hidden", !has));
   document.querySelectorAll(".tab").forEach((t) => /** @type {HTMLButtonElement} */ (t).disabled = !has);
 }
@@ -167,6 +203,7 @@ function updateVisibility() {
 async function init() {
   document.querySelectorAll(".tab").forEach((t) => t.addEventListener("click", () => switchTab(t.getAttribute("data-tab"))));
   $("newProjectBtn").addEventListener("click", newProject);
+  $("deleteProjectBtn").addEventListener("click", deleteProject);
   $("emptyNewBtn").addEventListener("click", newProject);
   $("projectSelect").addEventListener("change", (e) => openProject(/** @type {HTMLSelectElement} */ (e.target).value));
   try {
@@ -185,7 +222,7 @@ async function init() {
   renderGenerate($("tab-generate"));
   renderActivity($("tab-activity"));
   renderLive($("tab-live"));
-  setInterval(() => get("/api/health").then((hl) => { state.health = hl; renderStatus(); }).catch(() => {}), 30000);
+  setInterval(() => get("/api/health").then((hl) => { state.health = hl; renderStatus(); renderNextStep(); }).catch(() => {}), 30000);
   const last = localStorage.getItem("twin.project");
   if (last && state.projects.some((p) => p.id === last)) await openProject(last);
   else updateVisibility();

@@ -12,7 +12,7 @@
  * "Fix problems automatically" runs the rules and then the AI solver as one job and saves one new version.
  */
 import { state } from "./state.js";
-import { h, badge, toast, friendly } from "./ui.js";
+import { h, badge, toast, friendly, jobProgress } from "./ui.js";
 
 const SEV_ORDER = { error: 0, review: 1, warning: 2, info: 3 };
 const SEV_LABEL = { error: "Must fix", review: "Needs your OK", warning: "Check", info: "Note" };
@@ -21,6 +21,7 @@ const openGroups = new Set();
 let useAi = true;
 let notesOpen = false;
 let busy = null;   // label of the free fix running on the server (they take a few seconds on big plans)
+const freeFixFailed = new Set();   // problem codes the free fix could not solve: they get an "Ask AI" button too
 
 /**
  * @typedef {{report:any, reportError:any, scene:any, dirty:boolean, version:number, select:(t:string)=>void,
@@ -105,11 +106,7 @@ function autoFixBox(ctx, running) {
 
 function solveStatus(job) {
   const r = job.result;
-  if (isRunning(job)) {
-    const pct = Math.round((job.progress || 0) * 100);
-    return h("div.solve-status", null, h("div.small", null, job.stage || "working…"),
-      h("div.progress", { style: { marginTop: "4px" } }, h("div", { style: { width: `${pct}%` } })));
-  }
+  if (isRunning(job)) return h("div.solve-status", null, jobProgress({ ...job, stage: job.stage || "working…" }));
   if (job.status === "failed") return h("div.notice.error.solve-status", null, friendly(job.error));
   if (!r) return null;
   const ai = r.ai;
@@ -153,9 +150,9 @@ function groupActions(ctx, g, running) {
   const aiOk = !!state.health?.ai?.configured;
   const out = [];
   if (ruleCodes.has(g.code)) {
-    out.push(h("button.btn.small", { disabled: running, title: "Free; you can undo it", onclick: stop(() => fixWithRules(ctx, { codes: [g.code] }, g.title)) }, "Fix"));
+    out.push(h("button.btn.small", { disabled: running, title: "Free; you can undo it", onclick: stop(() => fixWithRules(ctx, { codes: [g.code] }, g.title, g.code)) }, "Fix"));
   }
-  if (g.fix === "ai" || g.fix === "decide") {
+  if (g.fix === "ai" || g.fix === "decide" || freeFixFailed.has(g.code)) {
     out.push(h("button.btn.small", { disabled: running || !aiOk, title: aiOk ? "The AI looks at the plan and proposes a fix as a new version" : "AI is not configured",
       onclick: stop(() => ctx.solve({ use_ai: true, codes: [g.code] })) }, "Ask AI"));
   }
@@ -179,14 +176,19 @@ function setOpenPlan(ctx, target) {
   if (room) room.open_plan = true;
 }
 
-async function fixWithRules(ctx, body, label) {
+async function fixWithRules(ctx, body, label, code) {
   if (busy) return;
   busy = label;
   ctx.redraw();
   try {
     const res = await ctx.tool("/api/scene/autofix", { ...body, brief: state.project.brief },
       (r) => r.actions.length ? `${label}: ${r.actions.length} fixed. Save the version to keep it (Ctrl+Z undoes it).` : "");
-    if (res && !res.actions.length) toast("The free fix could not solve this one. Try “Ask AI”, or click the item and edit it.", "info", 7000);
+    if (res && !res.actions.length) {
+      if (code) freeFixFailed.add(code);
+      toast(state.health?.ai?.configured
+        ? "The free fix could not solve this one. Press “Ask AI” next to it, or click the item and edit it."
+        : "The free fix could not solve this one. Click the item and edit it.", "info", 8000);
+    }
   } finally {
     busy = null;
     ctx.redraw();
@@ -199,7 +201,7 @@ function itemEl(ctx, g, i) {
   const ruleCodes = new Set(state.catalog?.rule_codes || []);
   const stop = (fn) => (e) => { e.stopPropagation(); fn(); };
   const extra = [];
-  if (ruleCodes.has(g.code) && t) extra.push(h("button.btn.tiny", { disabled: !!busy, onclick: stop(() => fixWithRules(ctx, { targets: [t] }, i.message.split(":")[0].slice(0, 60))) }, "Fix"));
+  if (ruleCodes.has(g.code) && t) extra.push(h("button.btn.tiny", { disabled: !!busy, onclick: stop(() => fixWithRules(ctx, { targets: [t] }, i.message.split(":")[0].slice(0, 60), g.code)) }, "Fix"));
   if (g.code === "W_ROOM_EDGE_NO_WALL" && t) {
     const rid = t.split(":")[1];
     extra.push(h("button.btn.tiny", { title: "The open edge is intentional", onclick: stop(() => ctx.edit(() => setOpenPlan(ctx, t))) }, "Open plan"),

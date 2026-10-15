@@ -5,6 +5,7 @@ Layout under TWIN_DATA_DIR:
     projects/<project_id>/uploads/<file_id>/{original.<ext>, normalized.png, thumb.png}
     projects/<project_id>/versions/v0001.json ...   (immutable once written)
     projects/<project_id>/builds/<build_id>/...      (one directory per build, never reused)
+    trash/...   folders being deleted (moved here first, so a folder in use is never half-deleted)
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 import secrets
+import shutil
 import sqlite3
 import threading
 import time
@@ -61,6 +63,10 @@ class NotFound(KeyError):
     pass
 
 
+class InUse(RuntimeError):
+    """A folder could not be deleted because another program still has one of its files open."""
+
+
 def new_id(prefix: str) -> str:
     return f"{prefix}_{secrets.token_hex(6)}"
 
@@ -70,6 +76,7 @@ class Storage:
         self.root = data_dir
         self.root.mkdir(parents=True, exist_ok=True)
         (self.root / "projects").mkdir(exist_ok=True)
+        shutil.rmtree(self.root / "trash", ignore_errors=True)  # leftovers of deletes that could not finish
         self.db_path = self.root / "twin.sqlite"
         self._lock = threading.RLock()
         with self.conn() as c:
@@ -112,6 +119,19 @@ class Storage:
             raise NotFound(bid)
         return self.project_dir(pid) / "builds" / bid
 
+    def _to_trash(self, folder: Path) -> Path | None:
+        """Move a folder into trash/ in one rename, which fails as a whole (nothing deleted) while another
+        program has a file in it open. Returns the moved folder, or None when there was no folder."""
+        if not folder.exists():
+            return None
+        dest = self.root / "trash" / f"{folder.name}_{secrets.token_hex(4)}"
+        dest.parent.mkdir(exist_ok=True)
+        try:
+            folder.rename(dest)
+        except OSError as exc:
+            raise InUse(folder.name) from exc
+        return dest
+
     # ---- projects -------------------------------------------------------------------------
     def create_project(self, name: str, brief: Brief) -> dict:
         pid = new_id("p")
@@ -153,6 +173,18 @@ class Storage:
     def brief(self, pid: str) -> Brief:
         return Brief.model_validate(self.get_project(pid)["brief"])
 
+    def delete_project(self, pid: str) -> None:
+        """Remove a project and everything in it: uploads, versions, jobs, builds and their files. The AI call
+        records stay, because the spending cap counts everything ever spent."""
+        self.get_project(pid)
+        trash = self._to_trash(self.project_dir(pid))
+        with self.conn() as c:
+            for table in ("files", "versions", "jobs", "builds"):
+                c.execute(f"DELETE FROM {table} WHERE project_id=?", (pid,))
+            c.execute("DELETE FROM projects WHERE id=?", (pid,))
+        if trash:
+            shutil.rmtree(trash, ignore_errors=True)
+
     # ---- files ------------------------------------------------------------------------------
     def add_file(self, pid: str, fid: str, kind: str, original_name: str, sniffed: str, data: bytes,
                  width: int, height: int, pages: int, page: int) -> dict:
@@ -184,6 +216,16 @@ class Storage:
             c.execute("UPDATE files SET calibration_json=? WHERE id=?",
                       (json.dumps(calibration) if calibration else None, fid))
         return self.get_file(pid, fid)
+
+    def delete_file(self, pid: str, fid: str) -> None:
+        """Remove an upload and its folder. Versions that name it as their source keep the id (history)."""
+        self.get_file(pid, fid)
+        trash = self._to_trash(self.upload_dir(pid, fid))
+        with self.conn() as c:
+            c.execute("DELETE FROM files WHERE id=? AND project_id=?", (fid, pid))
+        self.update_project(pid)
+        if trash:
+            shutil.rmtree(trash, ignore_errors=True)
 
     # ---- versions (immutable) ----------------------------------------------------------------
     def add_version(self, pid: str, scene: Scene, *, source: str, note: str, parent: int | None,
@@ -276,6 +318,13 @@ class Storage:
     def list_jobs(self, pid: str, limit: int = 30) -> list[dict]:
         with self.conn() as c:
             rows = c.execute("SELECT id FROM jobs WHERE project_id=? ORDER BY created_at DESC LIMIT ?", (pid, limit)).fetchall()
+        return [self.get_job(r["id"]) for r in rows]
+
+    def active_jobs(self, pid: str) -> list[dict]:
+        """Jobs of a project that are queued or still running."""
+        with self.conn() as c:
+            rows = c.execute("SELECT id FROM jobs WHERE project_id=? AND status IN ('queued','processing') "
+                             "ORDER BY created_at", (pid,)).fetchall()
         return [self.get_job(r["id"]) for r in rows]
 
     def fail_interrupted_jobs(self) -> int:

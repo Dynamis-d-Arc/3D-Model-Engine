@@ -1,11 +1,13 @@
 // @ts-check
-import { patch, post, upload } from "./api.js";
+import { del, patch, post, upload } from "./api.js";
 import { refreshProject, switchTab, watchJob } from "./app.js";
 import { state, on, emit } from "./state.js";
-import { h, mount, toast, showError, badge, fmtBytes } from "./ui.js";
+import { h, mount, toast, showError, badge, fmtBytes, confirmDialog, jobProgress } from "./ui.js";
 
 let root;
 let interpretJob = null;
+let jobEl = null;              // where the interpret job is drawn; replaced on every redraw of the tab
+const following = new Set();   // interpret jobs being polled
 
 export function planFileId() {
   const files = state.project?.files || [];
@@ -83,7 +85,7 @@ function draw() {
     dropzone("plan", false),
     h("div.thumbs", null, plans.map((f) => h("div.thumb" + (f.id === selectedPlan ? ".selected" : ""), {
       title: "Use this plan", onclick: () => { localStorage.setItem(`twin.plan.${p.id}`, f.id); emit("project", state.project); } },
-      h("img", { src: `/api/projects/${p.id}/files/${f.id}/thumb`, alt: f.original_name }),
+      h("img", { src: `/api/projects/${p.id}/files/${f.id}/thumb`, alt: f.original_name }), deleteButton(f),
       h("div.meta", null, f.original_name),
       h("div.meta", null, `${f.sniffed.toUpperCase()} · ${f.width}×${f.height}px${f.pages > 1 ? ` · page ${f.page + 1}/${f.pages}` : ""} · ${fmtBytes(f.bytes)}`),
       f.id === selectedPlan ? badge("in use", "ok") : null))));
@@ -92,7 +94,7 @@ function draw() {
     h("p.muted.small", null, "Interiors or furniture you like. Used only for materials and colours, never for geometry."),
     dropzone("reference", true),
     h("div.thumbs", null, refs.map((f) => h("div.thumb", null,
-      h("img", { src: `/api/projects/${p.id}/files/${f.id}/thumb`, alt: f.original_name }),
+      h("img", { src: `/api/projects/${p.id}/files/${f.id}/thumb`, alt: f.original_name }), deleteButton(f),
       h("label.meta", null, h("input", { type: "checkbox", checked: !off.includes(f.id), onchange: (e) => {
         const set = new Set(off);
         if (e.target.checked) set.delete(f.id); else set.add(f.id);
@@ -106,10 +108,30 @@ function draw() {
       "(Review layout → HVAC → Import). Live or simulated unit data then drives the airflow view (tab 4)."),
     dropzone("hvac", false),
     h("div.thumbs", null, hvacs.map((f) => h("div.thumb", null,
-      h("img", { src: `/api/projects/${p.id}/files/${f.id}/thumb`, alt: f.original_name }),
+      h("img", { src: `/api/projects/${p.id}/files/${f.id}/thumb`, alt: f.original_name }), deleteButton(f),
       h("div.meta", null, f.original_name),
       h("div.meta", null, `${f.sniffed.toUpperCase()} · ${fmtBytes(f.bytes)}`)))));
   mount(root, h("div.grid2", null, h("div", null, briefCard, startCard()), h("div", null, planCard, hvacCard, refCard)));
+}
+
+/** The × on a file thumbnail: deletes that upload after a confirmation. */
+function deleteButton(f) {
+  const p = state.project;
+  const what = { plan: "floor plan", hvac: "HVAC drawing", reference: "reference image" }[f.kind] || "file";
+  const remove = async (e) => {
+    e.stopPropagation();   // a click on a plan thumbnail would otherwise select it
+    const ok = await confirmDialog(`Delete ${what}`,
+      `Delete "${f.original_name}"? Saved layout versions and 3D models are kept.`, "Delete", true);
+    if (!ok) return;
+    try {
+      await del(`/api/projects/${p.id}/files/${f.id}`);
+      if (localStorage.getItem(`twin.plan.${p.id}`) === f.id) localStorage.removeItem(`twin.plan.${p.id}`);
+      toast(`Deleted ${f.original_name}`, "ok", 2500);
+    } catch (err) { showError(err, `Deleting ${f.original_name} failed`); }
+    await refreshProject();
+  };
+  return h("button.btn.small.thumb-del", { type: "button", title: `Delete this ${what}`,
+    "aria-label": `Delete ${f.original_name}`, onclick: remove }, "×");
 }
 
 function dropzone(kind, multiple) {
@@ -141,28 +163,46 @@ function dropzone(kind, multiple) {
   return h("div", null, zone, input, kind === "plan" ? h("div.row.small.muted", { style: { marginTop: "6px" } }, "PDF page:", pageInput) : null);
 }
 
+/** Poll an interpret job until it ends, drawing it into whatever jobEl is current (the tab redraws meanwhile). */
+async function follow(job) {
+  following.add(job.id);
+  interpretJob = job;
+  const show = (j) => { if (jobEl && state.project?.id === j.project_id) drawJob(jobEl, j); };
+  show(job);
+  const final = await watchJob(job.id, (j) => { interpretJob = j; show(j); });
+  await refreshProject();
+  if (final.status === "needs_review" && state.project?.id === final.project_id) {
+    state.version = final.result.version;
+    toast("Interpretation ready for review. Check every dimension before generating.", "ok");
+    switchTab("review");
+    emit("version", state.version);
+  }
+}
+
 function startCard() {
   const p = state.project;
   const ai = state.health.ai;
-  const status = h("div");
+  const status = jobEl = h("div");
+  // an interpretation still running (e.g. started before the page was reloaded) is picked up again
+  const running = p.jobs?.find((j) => j.kind === "interpret" && ["queued", "processing"].includes(j.status));
+  if (running && !following.has(running.id)) follow(running).catch((e) => showError(e, "AI interpretation"));
   const job = interpretJob && interpretJob.project_id === p.id ? interpretJob : null;
   if (job) drawJob(status, job);
+  const busy = !!job && ["queued", "processing"].includes(job.status);
 
+  const aiBtn = h("button.btn.primary", { onclick: () => runAI(), disabled: !ai.configured || busy }, busy ? "Interpreting…" : "Interpret with AI");
   const runAI = async () => {
     const plan = planFileId();
     if (!plan && !p.brief.prompt) return toast("Upload a floor plan or describe the layout first.", "error");
+    aiBtn.disabled = true;
+    aiBtn.textContent = "Interpreting…";
     try {
-      interpretJob = await post(`/api/projects/${p.id}/interpret`, { plan_file_id: plan, reference_file_ids: referenceIds() });
-      drawJob(status, interpretJob);
-      const final = await watchJob(interpretJob.id, (j) => { interpretJob = j; drawJob(status, j); });
-      await refreshProject();
-      if (final.status === "needs_review") {
-        state.version = final.result.version;
-        toast("Interpretation ready for review. Check every dimension before generating.", "ok");
-        switchTab("review");
-        emit("version", state.version);
-      }
-    } catch (e) { showError(e, "AI interpretation"); }
+      await follow(await post(`/api/projects/${p.id}/interpret`, { plan_file_id: plan, reference_file_ids: referenceIds() }));
+    } catch (e) {
+      showError(e, "AI interpretation");
+      aiBtn.disabled = false;
+      aiBtn.textContent = "Interpret with AI";
+    }
   };
   const fromFixture = async () => {
     try {
@@ -185,7 +225,7 @@ function startCard() {
   };
 
   return h("div.card", null, h("h2", null, "Create the layout"),
-    h("div.row", null, h("button.btn.primary", { onclick: runAI, disabled: !ai.configured }, "Interpret with AI"),
+    h("div.row", null, aiBtn,
       h("span.small.muted", null, ai.configured ? `Model ${ai.model} reads the plan, your dimensions and references.`
         : "AI is not configured yet (set TWIN_AI_API_KEY and TWIN_AI_MODEL in .env and restart).")),
     h("div.row", null, h("button.btn", { onclick: fromBlank }, "Start from overall dimensions"),
@@ -196,10 +236,7 @@ function startCard() {
 }
 
 function drawJob(el, job) {
-  const pct = Math.round((job.progress || 0) * 100);
-  mount(el, h("div", { style: { marginTop: "12px" } },
-    h("div.row", null, badge(job.status), h("span.small", null, job.stage || ""), h("span.spacer"), h("span.small.muted", null, `${pct}%`)),
-    h("div.progress", { style: { marginTop: "6px" } }, h("div", { style: { width: `${pct}%` } })),
+  mount(el, h("div", { style: { marginTop: "12px" } }, jobProgress(job),
     job.status === "failed" ? h("div.notice.error", { style: { marginTop: "8px" } },
       h("b", null, job.error?.code || "Failed"), ": ", job.error?.message || "",
       job.error?.detail ? h("pre.detail", null, JSON.stringify(job.error.detail, null, 1)) : null) : null,

@@ -25,7 +25,7 @@ from twin.ai.budget import BudgetGuard
 from twin.ai.client import AIClient, AIError, AIResult
 from twin.ai.interpret import interpret_plan, outcome_from_response, redesign_room
 from twin.api.jobs import JobContext, JobManager
-from twin.api.storage import NotFound, Storage, new_id
+from twin.api.storage import InUse, NotFound, Storage, new_id
 from twin.assets.catalog import load_catalog
 from twin.blender.runner import blender_version
 from twin.config import PROJECT_ROOT, Settings, get_settings, install_log_redaction
@@ -45,6 +45,7 @@ from twin.scene.model import (Brief, Certainty, Level, NEEDS_REVIEW_STATUSES, Pr
                               Wall, scene_json_schema)
 from twin.scene.styles import BUILTIN_MATERIALS, STYLES
 from twin.scene.validate import validate_scene
+from twin.viewer.stacks import StackStore
 
 log = logging.getLogger("twin.api")
 FRONTEND_DIR = PROJECT_ROOT / "frontend"
@@ -223,6 +224,13 @@ def create_app(settings: Settings | None = None, ai_transport=None) -> FastAPI:
         return JSONResponse({"error": {"code": "NOT_FOUND", "message": f"Not found: {exc.args[0]}", "detail": None}},
                             status_code=404)
 
+    @app.exception_handler(InUse)
+    async def in_use(_req: Request, exc: InUse):
+        return JSONResponse({"error": {"code": "FILES_IN_USE", "detail": exc.args[0],
+                                       "message": "Some of these files are open in another program (for example Blender, "
+                                                  "a viewer or File Explorer). Close it and try again. Nothing was deleted."}},
+                            status_code=409)
+
     from fastapi.exceptions import RequestValidationError
 
     @app.exception_handler(RequestValidationError)
@@ -295,6 +303,32 @@ def create_app(settings: Settings | None = None, ai_transport=None) -> FastAPI:
     def patch_project(pid: str, body: ProjectPatch) -> dict:
         return storage.update_project(pid, name=body.name, brief=body.brief)
 
+    def ensure_idle(pid: str) -> None:
+        """Deleting under a running job would pull its files away mid-way: refuse until it has finished."""
+        running = storage.active_jobs(pid)
+        if running:
+            kinds = ", ".join(sorted({j["kind"].replace("_", " ") for j in running}))
+            raise ApiError(409, "PROJECT_BUSY", f"This project still has work running ({kinds}). Wait for it to "
+                                                "finish, then try again.", [j["id"] for j in running])
+
+    @app.delete("/api/projects/{pid}")
+    def delete_project(pid: str) -> dict:
+        """Delete a project with all its files, versions and builds. Cannot be undone."""
+        storage.get_project(pid)
+        ensure_idle(pid)
+        buildings = [s["name"] for s in StackStore(settings.data_dir).list()
+                     if any(f["project_id"] == pid for f in s["floors"])]
+        if buildings:
+            raise ApiError(409, "PROJECT_IN_BUILDING", f"This project is a floor of the multi-floor building "
+                                                       f"{', '.join(repr(n) for n in buildings)}. Take it out of the "
+                                                       "building (Generate & preview, Multi-floor building) first.",
+                           buildings)
+        for s in list(app.state.streamer.sessions.values()):   # streamed walkthroughs of this project end now
+            if s.project_id == pid and s.proc.poll() is None:
+                app.state.streamer.stop(s.id)
+        storage.delete_project(pid)
+        return {"deleted": pid}
+
     # ---- uploads -----------------------------------------------------------------------------
     @app.post("/api/projects/{pid}/files", status_code=201)
     async def upload(pid: str, file: UploadFile = File(...), kind: Literal["plan", "reference", "hvac"] = Form(...),
@@ -343,6 +377,14 @@ def create_app(settings: Settings | None = None, ai_transport=None) -> FastAPI:
     @app.put("/api/projects/{pid}/files/{fid}/calibration")
     def calibration(pid: str, fid: str, body: CalibrationBody) -> dict:
         return storage.set_calibration(pid, fid, body.calibration)
+
+    @app.delete("/api/projects/{pid}/files/{fid}")
+    def delete_file(pid: str, fid: str) -> dict:
+        """Delete an uploaded plan, HVAC drawing or reference image. Saved versions and builds are kept."""
+        storage.get_file(pid, fid)
+        ensure_idle(pid)
+        storage.delete_file(pid, fid)
+        return {"deleted": fid}
 
     # ---- scene versions ----------------------------------------------------------------------
     def store_version(pid: str, scene: Scene, source: str, note: str, parent: int | None) -> dict:
@@ -508,7 +550,7 @@ def create_app(settings: Settings | None = None, ai_transport=None) -> FastAPI:
         brief = storage.brief(pid)
 
         def run(ctx: JobContext) -> tuple[str, dict]:
-            ctx.progress(0.1, "sending plan to the AI model")
+            ctx.progress(0.1, f"waiting for {settings.ai.model} to read the plan")
             client = ai_client(ctx, "interpret")
             info = None
             if plan_meta:
@@ -963,6 +1005,15 @@ def create_app(settings: Settings | None = None, ai_transport=None) -> FastAPI:
         pass
 
     # ---- frontend ----------------------------------------------------------------------------
+    @app.middleware("http")
+    async def revalidate_frontend(request: Request, call_next):
+        response = await call_next(request)
+        if request.url.path.startswith("/app"):
+            # the browser asks for a newer file on every load (304 when unchanged), so an updated module is never
+            # served stale from its heuristic cache
+            response.headers["Cache-Control"] = "no-cache"
+        return response
+
     if FRONTEND_DIR.is_dir():
         three = FRONTEND_DIR / "node_modules" / "three"
         if three.is_dir():

@@ -30,6 +30,8 @@ from twin.scene.validate import (OPENING_HEAD_CLEARANCE, Issue, ValidationReport
 MAX_SPLIT = 12            # a stretched item becomes at most this many items in a row
 OPENING_SEARCH_M = 1.0    # how far a door / window may slide along its wall
 MIN_OPENING_WIDTH = {"door": 0.7, "window": 0.4, "opening": 0.6}
+# last resort on a short wall (e.g. a facet of a curved bay): shrink the opening to the wall's free stretch, not below
+FIT_MIN_WIDTH = {"door": 0.6, "window": 0.25, "opening": 0.4}
 SWING_SEARCH_M = 1.5      # how far furniture may move out of a door swing
 
 
@@ -348,7 +350,39 @@ def _slide_opening(scene: Scene, oid: str) -> tuple[Scene, str]:
                     if width != o.width:
                         what.append(f"narrowed it {o.width:.2f} → {width:.2f} m")
                     return scene, f"{o.kind.title()} {o.id}: {' and '.join(what)}."
+    # no room at the usual sizes (a short wall): fill the free stretch nearest to where it was
+    free = _free_spans(f.length, [(lo, hi) for lo, hi, _ in zones] + others)
+    best = None
+    for lo, hi in free:
+        width = min(o.width, math.floor((hi - lo - 0.01) * 100) / 100)
+        off = round((lo + hi) / 2, 3)
+        if width >= FIT_MIN_WIDTH[o.kind] - 1e-9 and ok(off, width) and (best is None or abs(off - o.offset) < abs(best[0] - o.offset)):
+            best = (off, width, hi - lo)
+    if best is not None:
+        off, width, clear = best
+        moved = o.model_copy(update={"offset": off, "width": width,
+                                     "certainty": _auto(o.certainty, "auto-fix: narrowed to the free stretch of a short wall")})
+        scene = scene.model_copy(update={"openings": [moved if x.id == o.id else x for x in scene.openings]})
+        return scene, (f"{o.kind.title()} {o.id}: narrowed it {o.width:.2f} → {width:.2f} m to fit the {clear:.2f} m of "
+                       f"wall {wall.id} that is clear of its corners.")
+    if o.kind == "window":   # a door is never removed: the room behind it may have no other way in
+        clear = max((hi - lo for lo, hi in free), default=0.0)
+        scene = scene.model_copy(update={"openings": [x for x in scene.openings if x.id != o.id]})
+        return scene, (f"Window {o.id}: removed it, because wall {wall.id} has only {clear:.2f} m clear of its corners, "
+                       f"too little for a window. Add one to a longer wall if you need it.")
     raise _Skip
+
+
+def _free_spans(length: float, blocked: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    """The stretches of a wall (0..length along it) that no blocked interval covers."""
+    spans, pos = [], 0.0
+    for lo, hi in sorted(blocked):
+        if lo > pos:
+            spans.append((pos, min(lo, length)))
+        pos = max(pos, hi)
+    if pos < length:
+        spans.append((pos, length))
+    return [(a, b) for a, b in spans if b > a]
 
 
 def fix_opening_position(scene: Scene, issue: Issue) -> tuple[Scene, str]:

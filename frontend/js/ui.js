@@ -81,7 +81,62 @@ export function fmtTime(ts) {
   return ts ? new Date(ts * 1000).toLocaleString() : "";
 }
 
+/** "Today 12:04 PM", "Yesterday 3:10 PM", "14 Oct, 9:02 AM" */
+export function fmtWhen(ts) {
+  if (!ts) return "";
+  const d = new Date(ts * 1000);
+  const time = d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  const day = (x) => new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime();
+  const ago = Math.round((day(new Date()) - day(d)) / 86400000);
+  if (ago === 0) return `Today ${time}`;
+  if (ago === 1) return `Yesterday ${time}`;
+  return `${d.toLocaleDateString([], { day: "numeric", month: "short" })}, ${time}`;
+}
+
 export const fmtM = (v, d = 2) => (v === null || v === undefined || Number.isNaN(v) ? "–" : Number(v).toFixed(d));
+
+/** 75 -> "1:15" */
+export function fmtElapsed(s) {
+  const m = Math.floor(s / 60);
+  return `${m}:${String(Math.floor(s % 60)).padStart(2, "0")}`;
+}
+
+export const isRunningJob = (job) => ["queued", "processing"].includes(job?.status);
+const AI_JOBS = ["interpret", "redesign", "fix", "solve", "furniture"];
+const BUILD_ANIM_S = 8;   // one cycle of the building animation; the bar's stripes and shimmer divide it evenly
+
+// a building going up floor by floor under a crane (CSS animations in styles.css, .build-anim)
+const BUILD_SVG = `<svg viewBox="0 0 120 84" width="96" height="68" aria-hidden="true">
+  <line class="ba-ground" x1="6" y1="78.5" x2="114" y2="78.5"/>
+  <g class="ba-crane"><path d="M98 78 V12 M38 12 H114 M98 12 L106 4 L114 12"/>
+    <g class="ba-hook"><line x1="54" y1="12" x2="54" y2="22"/><rect x="51" y="22" width="6" height="4"/></g></g>
+  ${[64, 50, 36, 22].map((y, i) => `<g class="ba-floor ba-f${i + 1}"><rect x="30" y="${y}" width="48" height="14"/>` +
+    [36, 51, 66].map((x) => `<rect class="ba-win" x="${x}" y="${y + 4}" width="7" height="6"/>`).join("") + "</g>").join("")}
+</svg>`;
+
+/**
+ * A background job's progress. While it runs: a building going up, what it is doing, the time since it started
+ * and a moving bar, so a long wait (an AI answer on a whole plan can take minutes) never looks frozen.
+ * Panels redraw this on every poll; the animations follow one clock (--phase), so they carry on instead of restarting.
+ * @param {any} job  @param {{title?: string}} [opts]
+ */
+export function jobProgress(job, opts = {}) {
+  const pct = Math.round((job.progress || 0) * 100);
+  const running = isRunningJob(job);
+  const head = (extra) => h("div.row", null, opts.title ? h("b", null, opts.title) : null, badge(job.status),
+    h("span.small", null, job.stage || (job.status === "queued" ? "waiting for its turn" : "")), h("span.spacer"), extra);
+  const bar = h("div.progress" + (running ? ".running" : ""), { style: { marginTop: "6px" } }, h("div", { style: { width: `${pct}%` } }));
+  if (!running) return h("div", null, head(h("span.small.muted", null, `${pct}%`)), bar);
+  const since = job.started_at || job.created_at;
+  const elapsed = since ? fmtElapsed(Math.max(0, Date.now() / 1000 - since)) : "";
+  const el = h("div.job-progress", null, h("div.build-anim", { html: BUILD_SVG }),
+    h("div.job-info", null, head(h("span.small.muted", { title: "time since it started · progress" }, `${elapsed} · ${pct}%`)), bar,
+      AI_JOBS.includes(job.kind) && job.status === "processing"
+        ? h("div.small.muted", { style: { marginTop: "6px" } }, "AI answers on a whole plan can take several minutes. This keeps updating by itself.")
+        : null));
+  el.style.setProperty("--phase", `-${((performance.now() / 1000) % BUILD_ANIM_S).toFixed(2)}s`);
+  return el;
+}
 
 /**
  * Simple modal prompt built on <dialog>. Resolves with form values or null.
@@ -125,12 +180,14 @@ export function ask(title, fields, okLabel = "OK") {
   });
 }
 
-export function confirmDialog(title, message, okLabel = "Continue") {
+/** danger: the OK button is red (for deletes that cannot be undone). */
+export function confirmDialog(title, message, okLabel = "Continue", danger = false) {
   const dlg = /** @type {HTMLDialogElement} */ (document.getElementById("dialog"));
   return new Promise((resolve) => {
     mount(dlg, h("form", { method: "dialog" }, h("h2", null, title), h("p", null, message),
       h("div.row", { style: { justifyContent: "flex-end" } },
-        h("button.btn", { value: "cancel" }, "Cancel"), h("button.btn.primary", { value: "ok" }, okLabel))));
+        h("button.btn", { value: "cancel" }, "Cancel"),
+        h(danger ? "button.btn.primary.danger" : "button.btn.primary", { value: "ok" }, okLabel))));
     dlg.onclose = () => resolve(dlg.returnValue === "ok");
     dlg.showModal();
   });
