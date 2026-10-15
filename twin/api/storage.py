@@ -210,6 +210,12 @@ class Storage:
             rows = c.execute("SELECT id FROM files WHERE project_id=? ORDER BY created_at", (pid,)).fetchall()
         return [self.get_file(pid, r["id"]) for r in rows]
 
+    def set_file_kind(self, pid: str, fid: str, kind: str) -> dict:
+        self.get_file(pid, fid)
+        with self.conn() as c:
+            c.execute("UPDATE files SET kind=? WHERE id=?", (kind, fid))
+        return self.get_file(pid, fid)
+
     def set_calibration(self, pid: str, fid: str, calibration: dict | None) -> dict:
         self.get_file(pid, fid)
         with self.conn() as c:

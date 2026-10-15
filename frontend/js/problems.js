@@ -10,6 +10,7 @@
  *   manual  only the user knows: click the item and edit it
  *   info    notes, folded away
  * "Fix problems automatically" runs the rules and then the AI solver as one job and saves one new version.
+ * Every other button here saves its change as a new version by itself (a burst of clicks becomes one version).
  */
 import { state } from "./state.js";
 import { h, badge, toast, friendly, jobProgress } from "./ui.js";
@@ -25,8 +26,8 @@ const freeFixFailed = new Set();   // problem codes the free fix could not solve
 
 /**
  * @typedef {{report:any, reportError:any, scene:any, dirty:boolean, version:number, select:(t:string)=>void,
- *   tool:(path:string, body:any, msg?:(r:any)=>string)=>Promise<any>, edit:(fn:()=>void)=>void,
- *   solve:(opts:any)=>void, solveJob:any, estimate:any}} Ctx
+ *   tool:(path:string, body:any, msg?:(r:any)=>string)=>Promise<any>, edit:(fn:()=>void)=>void, autosave:(note:string)=>void,
+ *   solve:(opts:any)=>void, solveJob:any, estimate:any, redraw:()=>void}} Ctx
  */
 
 function info(code) {
@@ -158,14 +159,20 @@ function groupActions(ctx, g, running) {
   }
   if (g.fix === "decide" && g.code === "W_ROOM_EDGE_NO_WALL") {
     out.push(h("button.btn.small", { title: "These edges are meant to be open; stop warning about them",
-      onclick: stop(() => ctx.edit(() => { for (const i of g.items) setOpenPlan(ctx, i.targets[0]); })) }, "All open plan"));
+      onclick: stop(() => { ctx.edit(() => { for (const i of g.items) setOpenPlan(ctx, i.targets[0]); }); ctx.autosave("open plan edges"); }) }, "All open plan"));
   }
   if (g.fix === "accept") {
-    out.push(h("button.btn.small", { onclick: stop(() => ctx.tool("/api/scene/accept-estimates", {}, (r) => `${r.changed} values accepted as estimates`)) }, "Accept all"));
+    out.push(h("button.btn.small", { onclick: stop(async () => {
+      const r = await ctx.tool("/api/scene/accept-estimates", {}, (x) => `${x.changed} values accepted as estimates`);
+      if (r?.changed) ctx.autosave(`accepted ${r.changed} estimated values`);
+    }) }, "Accept all"));
   }
   if (g.fix === "answer") {
     out.push(h("button.btn.small", { title: "Keep the layout as drawn for every open question",
-      onclick: stop(() => ctx.edit(() => { for (const q of ctx.scene.open_questions) if (!q.resolved) { q.resolved = true; q.answer = q.answer || "accepted as drawn"; } })) }, "Accept all as drawn"));
+      onclick: stop(() => {
+        ctx.edit(() => { for (const q of ctx.scene.open_questions) if (!q.resolved) { q.resolved = true; q.answer = q.answer || "accepted as drawn"; } });
+        ctx.autosave("AI questions accepted as drawn");
+      }) }, "Accept all as drawn"));
   }
   return out;
 }
@@ -182,7 +189,8 @@ async function fixWithRules(ctx, body, label, code) {
   ctx.redraw();
   try {
     const res = await ctx.tool("/api/scene/autofix", { ...body, brief: state.project.brief },
-      (r) => r.actions.length ? `${label}: ${r.actions.length} fixed. Save the version to keep it (Ctrl+Z undoes it).` : "");
+      (r) => r.actions.length ? `${label}: ${r.actions.length} fixed.` : "");
+    if (res?.actions.length) ctx.autosave(`${label}: ${res.actions.length} fixed`);
     if (res && !res.actions.length) {
       if (code) freeFixFailed.add(code);
       toast(state.health?.ai?.configured
@@ -204,9 +212,12 @@ function itemEl(ctx, g, i) {
   if (ruleCodes.has(g.code) && t) extra.push(h("button.btn.tiny", { disabled: !!busy, onclick: stop(() => fixWithRules(ctx, { targets: [t] }, i.message.split(":")[0].slice(0, 60), g.code)) }, "Fix"));
   if (g.code === "W_ROOM_EDGE_NO_WALL" && t) {
     const rid = t.split(":")[1];
-    extra.push(h("button.btn.tiny", { title: "The open edge is intentional", onclick: stop(() => ctx.edit(() => setOpenPlan(ctx, t))) }, "Open plan"),
+    extra.push(h("button.btn.tiny", { title: "The open edge is intentional", onclick: stop(() => { ctx.edit(() => setOpenPlan(ctx, t)); ctx.autosave("open plan edge"); }) }, "Open plan"),
       h("button.btn.tiny", { title: "Add walls along the open edges of this room",
-        onclick: stop(() => ctx.tool("/api/scene/add-missing-walls", { room_id: rid }, (r) => r.notes.length ? r.notes.join("; ") : "No open edge longer than 30 cm")) }, "Add wall"));
+        onclick: stop(async () => {
+          const r = await ctx.tool("/api/scene/add-missing-walls", { room_id: rid }, (x) => x.notes.length ? x.notes.join("; ") : "No open edge longer than 30 cm");
+          if (r?.notes?.length) ctx.autosave("walls added along open edges");
+        }) }, "Add wall"));
   }
   if (g.code === "Q_OPEN_QUESTION" && qid) {
     const q = ctx.scene.open_questions.find((x) => x.id === qid);
@@ -214,8 +225,8 @@ function itemEl(ctx, g, i) {
       const inp = h("input", { placeholder: "Your answer (optional)", onclick: (e) => e.stopPropagation() });
       return h("li.pq", null, h("div", null, i.message),
         h("div.row", { style: { marginTop: "4px" } }, inp,
-          h("button.btn.tiny", { onclick: stop(() => ctx.edit(() => { q.answer = inp.value || "answered"; q.resolved = true; })) }, "Answer"),
-          h("button.btn.tiny", { onclick: stop(() => ctx.edit(() => { q.answer = "accepted as drawn"; q.resolved = true; })) }, "Accept as drawn")));
+          h("button.btn.tiny", { onclick: stop(() => { ctx.edit(() => { q.answer = inp.value || "answered"; q.resolved = true; }); ctx.autosave("AI question answered"); }) }, "Answer"),
+          h("button.btn.tiny", { onclick: stop(() => { ctx.edit(() => { q.answer = "accepted as drawn"; q.resolved = true; }); ctx.autosave("AI question accepted as drawn"); }) }, "Accept as drawn")));
     }
   }
   return h("li", { onclick: () => t && ctx.select(t), title: t ? "Show it on the plan" : "" },

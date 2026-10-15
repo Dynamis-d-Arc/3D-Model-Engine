@@ -35,6 +35,9 @@ verification.
 
 ## Quick start (Windows)
 
+Double-click **start.bat** (or run `powershell -ExecutionPolicy Bypass -File start.ps1`): it sets up whatever is missing
+(Python environment, packages, three.js, `.env`), starts the server and opens the browser. Or step by step:
+
 ```bash
 uv venv --python 3.12 .venv
 ```
@@ -53,12 +56,13 @@ set `TWIN_BLENDER_PATH` otherwise. Without an AI key everything except "Interpre
 
 ### Turning on the AI (OpenAI-compatible key)
 
-1. Copy `.env.example` to `.env` and set `TWIN_AI_API_KEY` (never commit `.env`; it is git-ignored).
+1. Copy `.env.example` to `.env` (start.bat does it) and set `TWIN_AI_API_KEY` (never commit `.env`; it is git-ignored).
 2. List the models your key can use and test image + strict-JSON support:
    ```bash
    .venv/Scripts/python.exe -m twin.ai.probe
    ```
-3. Put a model that passes into `TWIN_AI_MODEL`, restart the server, run the probe again.
+3. Put a model that passes into `TWIN_AI_MODEL`, restart the server, run the probe again. For the models in
+   `MODEL_PRICES` (`twin/config.py`) the spending cap knows the price; any other model needs `TWIN_AI_PRICE_*_PER_1M`.
 4. Optional real test (costs tokens): `TWIN_RUN_LIVE_AI=1 .venv/Scripts/python.exe -m pytest -m live_ai -s`
 
 ### Unreal desktop viewer (no editor needed to view)
@@ -80,15 +84,25 @@ on a completed build, or see [docs/UNREAL.md](docs/UNREAL.md) for manual steps.
 
 ## Using it
 
-1. **Brief & files** – name, style, prompt, outer dimensions, wall height, room sizes you know;
-   upload the plan (and style references).
-2. Create a layout: **Interpret with AI**, **Start from overall dimensions** (trace manually), or
-   **Use sample apartment** (known measurements).
+**The short way** ([docs/AUTOPILOT.md](docs/AUTOPILOT.md)): drop all your drawings on the start page (floor plan,
+HVAC drawing, furniture list or sensor sheet CSV, photos; each file is sorted by itself) and press **Make the 3D
+model**. It reads the plan, places the HVAC drawing, furniture and sensors, fixes the problems, accepts the estimates
+and builds the model, then shows what it assumed so you can check it. It only stops for what it cannot decide (a
+blocking question, a problem no fix could solve); **Finish automatically** in the bar continues from there. Tick
+*Let me check the layout before it is built* to review first.
+
+**Step by step:**
+
+1. **Brief & files** – drop the drawings; optionally the name, style, a description, outer dimensions, wall height,
+   room sizes you know (saved as you type).
+2. Create a layout (*Other ways to start*): **Only read the plan (AI)**, **Start from overall dimensions** (trace
+   manually), or **Use sample apartment** (known measurements).
 3. **Review layout** – the **Problems** checklist groups what is wrong in plain words; **Fix problems
    automatically** fixes the mechanical ones for free and sends the rest to the AI problem solver
    (gpt-5.3-codex), saving one new version to look at (docs/PROBLEMS.md). Calibrate the plan image, draw or
    adjust rooms (shared corners move together), add doors/windows/furniture, confirm or accept estimated
-   measurements, answer AI questions, **Save version**. The bar under the tabs always says what to do next.
+   measurements, answer AI questions (the checklist buttons save a version by themselves; drawn edits need
+   **Save version**). The bar under the tabs always says what to do next.
 4. **Generate & preview** – Blender builds and verifies; preview the GLB, view renders, download
    the `.blend`, the Unreal bundle, FBX/GLB, manifest and reports.
 5. **HVAC (optional)** – upload the HVAC drawing in step 1, *Import HVAC drawing* in Review, accept the
@@ -114,6 +128,7 @@ on a completed build, or see [docs/UNREAL.md](docs/UNREAL.md) for manual steps.
 
 ## Documentation
 
+- [docs/AUTOPILOT.md](docs/AUTOPILOT.md) – one click from drawings to a 3D model, the single drop zone, furniture lists
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) – modules, data flow, storage, jobs, versioning
 - [docs/SCENE_MODEL.md](docs/SCENE_MODEL.md) – coordinate system, schema, validation codes, geometry rules
 - [docs/AI.md](docs/AI.md) – provider configuration, schema, honesty rules, errors, costs

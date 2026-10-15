@@ -77,8 +77,16 @@ def _detect_unreal() -> str | None:
 
 
 SOLVER_DEFAULT_MODEL = "gpt-5.3-codex"
-# USD per 1M tokens (input, output), Standard tier, developers.openai.com/api/docs/pricing (checked 2026-10-14)
-SOLVER_PRICES: dict[str, tuple[float, float]] = {"gpt-5.3-codex": (1.75, 14.0)}
+# Published prices, USD per 1M tokens (input, output), Standard tier, developers.openai.com/api/docs/pricing.
+# A model listed here needs no TWIN_AI_PRICE_* settings for the spending cap; any other model still fails closed
+# (AI_BUDGET_PRICES_MISSING) until its prices are set. TWIN_AI_PRICE_* always win over this table.
+MODEL_PRICES: dict[str, tuple[float, float]] = {
+    "gpt-5.3-codex": (1.75, 14.0),    # checked 2026-10-14
+    "gpt-6.1-sol": (2.00, 10.00),     # checked 2026-10-13
+    "gpt-5.6-sol": (4.00, 20.00),     # checked 2026-10-13
+    "gpt-6-luna": (0.10, 0.50),       # checked 2026-10-13
+}
+SOLVER_PRICES = MODEL_PRICES
 
 
 @dataclass(frozen=True)
@@ -183,6 +191,13 @@ def load_settings(env: dict[str, str] | None = None, env_file: Path | None = ENV
     key_name = next((n for n in ("TWIN_AI_API_KEY", "OPENAI_API_KEY") if env.get(n) or fv.get(n)), None)
     key = _lookup(env, fv, "TWIN_AI_API_KEY", "OPENAI_API_KEY")
     data_dir = Path(_lookup(env, fv, "TWIN_DATA_DIR", default=str(PROJECT_ROOT / "data")))
+
+    def _price(env_, fv_, name: str, i: int) -> float | None:
+        """The configured price, else the published one for a model in MODEL_PRICES."""
+        v = _float_or_none(_lookup(env_, fv_, name), name)
+        known = MODEL_PRICES.get(_lookup(env_, fv_, "TWIN_AI_MODEL") or "")
+        return v if v is not None else (known[i] if known else None)
+
     ai = AISettings(
         api_key=SecretStr(key) if key else None,
         base_url=_lookup(env, fv, "TWIN_AI_BASE_URL", default="https://api.openai.com/v1").rstrip("/"),
@@ -195,8 +210,8 @@ def load_settings(env: dict[str, str] | None = None, env_file: Path | None = ENV
         daily_request_limit=int(_lookup(env, fv, "TWIN_AI_DAILY_REQUEST_LIMIT", default="200")),
         key_source=key_name,
         budget_usd=_float_or_none(_lookup(env, fv, "TWIN_AI_BUDGET_USD"), "TWIN_AI_BUDGET_USD"),
-        price_input_per_1m=_float_or_none(_lookup(env, fv, "TWIN_AI_PRICE_INPUT_PER_1M"), "TWIN_AI_PRICE_INPUT_PER_1M"),
-        price_output_per_1m=_float_or_none(_lookup(env, fv, "TWIN_AI_PRICE_OUTPUT_PER_1M"), "TWIN_AI_PRICE_OUTPUT_PER_1M"),
+        price_input_per_1m=_price(env, fv, "TWIN_AI_PRICE_INPUT_PER_1M", 0),
+        price_output_per_1m=_price(env, fv, "TWIN_AI_PRICE_OUTPUT_PER_1M", 1),
         service_tier=_lookup(env, fv, "TWIN_AI_SERVICE_TIER", default="default") or None,
         furniture_effort=_lookup(env, fv, "TWIN_AI_FURNITURE_EFFORT", default="low") or None,
         solver_model=_lookup(env, fv, "TWIN_AI_SOLVER_MODEL", default=SOLVER_DEFAULT_MODEL) or None,

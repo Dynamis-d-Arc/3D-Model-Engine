@@ -85,7 +85,7 @@ def run_import_process(spec: Path, ctx: JobContext) -> dict:
 
 
 def register(app: FastAPI, settings: Settings, storage: Storage, jobs: JobManager,
-             store_version: Callable[..., dict], api_error: type) -> None:
+             store_version: Callable[..., dict], api_error: type) -> Callable[..., dict]:
 
     def imports_dir(pid: str, job_id: str) -> Path:
         return storage.project_dir(pid) / "hvac_imports" / job_id
@@ -333,3 +333,5 @@ def register(app: FastAPI, settings: Settings, storage: Storage, jobs: JobManage
             if hvac_counts[key]["units"]:
                 out.append({"number": v["number"], "note": v["note"], "can_generate": v["can_generate"], **hvac_counts[key]})
         return out
+
+    return hvac_import   # the autopilot starts imports the same way the route does

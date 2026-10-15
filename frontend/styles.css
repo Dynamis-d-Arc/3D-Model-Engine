@@ -378,3 +378,29 @@ details.tech summary { cursor: pointer; font-size: 12px; color: var(--muted); ma
 .notice.busy { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
 .spinner { width: 14px; height: 14px; border-radius: 50%; border: 2px solid #b9cbe0; border-top-color: var(--accent); animation: spin .8s linear infinite; flex: none; }
 @keyframes spin { to { transform: rotate(360deg); } }
+
+/* ---- autopilot: one click from drawings to a 3D model ---- */
+.btn.big { padding: 9px 18px; font-size: 15px; font-weight: 600; }
+.card.autopilot { border-color: #b8cbe0; background: linear-gradient(180deg, #f5f9fd, #fff 60%); }
+.ap-steps { list-style: none; margin: 6px 0 0; padding: 0; display: flex; flex-direction: column; gap: 3px; }
+.ap-step { display: grid; grid-template-columns: 20px auto 1fr; gap: 6px; align-items: baseline; font-size: 13px; }
+.ap-step .ap-icon { color: var(--muted); text-align: center; display: inline-flex; justify-content: center; }
+.ap-step .ap-note { color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; }
+.ap-step.done .ap-icon { color: var(--ok); font-weight: 700; }
+.ap-step.running .ap-label { font-weight: 600; }
+.ap-step.skipped { color: var(--muted); }
+.ap-step.failed .ap-icon, .ap-step.failed .ap-label { color: var(--err); }
+.ap-step.waiting .ap-label, .ap-step.stopped .ap-label { color: var(--muted); }
+.ap-summary { border-color: #bcdcc7; }
+.ap-done { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 8px; }
+.ap-chip { font-size: 12px; padding: 2px 8px; border-radius: 999px; background: #e8f4ec; color: var(--ok); }
+.ap-chips { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
+.ap-assume-list { margin-top: 6px; }
+
+/* ---- one drop zone ---- */
+.dropzone.busy { display: flex; align-items: center; justify-content: center; gap: 8px; cursor: progress; }
+.empty-state .dropzone { padding: 42px 18px; font-size: 15px; background: #fff; margin: 18px 0 10px; }
+.csv-tile { height: 90px; display: flex; align-items: center; justify-content: center; background: #f2f6f1; color: var(--ok);
+  font-weight: 700; letter-spacing: .08em; border-radius: 4px; }
+.thumb .kind-sel { width: 100%; margin-top: 4px; font-size: 11px; padding: 1px 2px; }
+.toast-list { margin: 4px 0 0; padding-left: 18px; }

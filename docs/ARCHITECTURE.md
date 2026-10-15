@@ -5,7 +5,8 @@
 | Frontend | `frontend/` (plain ES modules, three.js from `node_modules`) | brief, uploads, 2D plan editor, validation UI, progress, GLB preview, downloads |
 | Backend API | `twin/api/app.py` (FastAPI) | projects, uploads, versions, scene tools, jobs, builds, downloads |
 | Storage | `twin/api/storage.py` | SQLite metadata + files under `TWIN_DATA_DIR` |
-| Jobs | `twin/api/jobs.py` | thread pools (ai ×2, blender ×1, unreal ×1), persisted status/progress/errors |
+| Jobs | `twin/api/jobs.py` | thread pools (ai ×2, blender ×1, unreal ×1, autopilot ×2), persisted status/progress/errors |
+| Autopilot | `twin/api/autopilot.py` | one job that runs the other jobs in order, from the drawings to a verified build — see [AUTOPILOT.md](AUTOPILOT.md) |
 | AI service | `twin/ai/` | provider client, prompts, strict schema, conversion to a scene draft, probe |
 | Imaging | `twin/imaging/preprocess.py` | content-sniffed PNG/JPG/PDF → normalised PNG + thumbnail |
 | Scene model | `twin/scene/model.py` | versioned pydantic schema (source of truth) |
@@ -18,7 +19,10 @@
 
 ## Data flow
 
-1. **Brief + uploads** are stored per project. Uploads are type-checked by content and normalised.
+1. **Brief + uploads** are stored per project. Uploads are type-checked by content and normalised; with `kind=auto`
+   they are sorted (plan, HVAC drawing, reference, furniture list or sensor sheet CSV) by `twin/imaging/classify.py`.
+   The **autopilot** runs steps 2–4 (and the HVAC, sensor and furniture imports) as one job; each step still saves
+   its own version.
 2. **Interpretation** (AI job, optional) returns JSON that must pass the strict schema and pydantic
    validation; it is converted into a scene draft with certainty flags and open questions and stored as
    a new version with status `needs_review`. Alternatives: the fixture, or a blank layout to trace.

@@ -4,6 +4,7 @@ import { api, get, post } from "./api.js";
 import { refreshProject, switchTab, watchJob } from "./app.js";
 import { state, on, emit } from "./state.js";
 import { h, mount, toast, showError, badge, fmtBytes, fmtTime, fmtWhen, fmtM, ask, confirmDialog, jobProgress } from "./ui.js";
+import { autopilotSummary } from "./autopilot.js";
 
 let root;
 let viewer = null;
@@ -21,7 +22,7 @@ export function renderGenerate(el) {
 
 const SOURCE_NAMES = { ai: "AI reading", ai_fix: "AI change", ai_furniture: "AI furniture", ai_redesign: "AI redesign",
   auto_fix: "auto-fixed", fixture: "sample", hvac: "HVAC import", hvac_import: "HVAC import", manual: "drawn by hand",
-  edit: "edited", derive: "walls rebuilt" };
+  edit: "edited", derive: "walls rebuilt", autopilot: "autopilot", furniture_list: "furniture list", sensor_sheet: "sensor sheet" };
 
 function versionOptions() {
   return state.project.versions.map((v) => h("option", { value: v.number, selected: v.number === state.version },
@@ -198,7 +199,8 @@ async function drawBuild(el, bid) {
   const st = state.health?.streaming;
   streamEl = h("div");
   const unrealInfo = h("div");
-  mount(el, streamEl,
+  const made = autopilotSummary(b);   // lists the accepted estimates itself
+  mount(el, streamEl, made,
     h("div.card", null, h("div.row", null, h("h2", { style: { margin: 0 } }, `Build ${bid.slice(2)} · scene v${b.version}`), badge("completed"),
       isLayer ? h("span.kind-tag", null, "sensor update") : null,
       h("span.spacer"),
@@ -212,7 +214,7 @@ async function drawBuild(el, bid) {
         `${v.files_checked} exported files re-imported and checked, max deviation ${(v.max_reimport_delta_m * 1000).toFixed(3)} mm (tolerance ${v.tolerance_m * 1000} mm)`,
         m.reused_exports.length ? ` · ${m.reused_exports.length} unchanged exports reused` : ""),
       layerLine,
-      accepted.length ? h("details.notice.warn", null, h("summary", null, `Built with ${accepted.length} accepted estimate(s): ` +
+      accepted.length && !made ? h("details.notice.warn", null, h("summary", null, `Built with ${accepted.length} accepted estimate(s): ` +
         Object.entries(accepted.reduce((a, t) => { const k = t.split(":")[0]; a[k] = (a[k] || 0) + 1; return a; }, {}))
           .map(([k, n]) => `${n} ${k === "furniture" ? "furniture items" : k + (n > 1 ? "s" : "")}`).join(", ")), h("div.small", { style: { marginTop: "6px" } }, accepted.join(", "))) : null,
       viewWrap),

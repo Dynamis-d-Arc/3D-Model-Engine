@@ -626,6 +626,21 @@ async function importSensorSheet(file) {
   } catch (e) { showError(e, "Sensor sheet"); }
 }
 
+async function importFurnitureList(file) {
+  if (!file) return;
+  try {
+    const text = await file.text();
+    const res = await post("/api/scene/import-furniture", { scene, text, replace: true });
+    if (res.added) {
+      edit(() => { scene = res.scene; });
+      autosave(`furniture list ${file.name}: ${res.added} items`);
+    }
+    toast(`Furniture list ${file.name}: ${res.added} placed, ${res.removed} replaced` +
+      (res.problems.length ? `, ${res.problems.length} row(s) skipped — ${res.problems.slice(0, 3).join("; ")}` : ""),
+      res.problems.length ? "error" : "ok", 12000);
+  } catch (e) { showError(e, "Furniture list"); }
+}
+
 function startDrag(e, apply) {
   snapshot();
   let moved = false;
@@ -1148,9 +1163,15 @@ function furnitureCard() {
   for (const f of scene.furniture) counts[f.asset_id] = (counts[f.asset_id] || 0) + 1;
   const top = Object.entries(counts).sort((a, b) => b[1] - a[1]).slice(0, 6)
     .map(([k, n]) => `${n}× ${assetById(k)?.name || k}`).join(", ");
+  const listIn = h("input", { type: "file", accept: ".csv,text/csv", style: { display: "none" },
+    onchange: (e) => { importFurnitureList(e.target.files[0]); e.target.value = ""; } });
   return h("div.card", null, h("h2", null, "Furniture & equipment"),
     h("div.small", { style: { margin: "0 0 6px" } }, scene.furniture.length
       ? `${scene.furniture.length} items in ${new Set(scene.furniture.map((f) => f.room_id)).size} rooms — ${top}` : "No furniture in this version."),
+    h("div.row", { style: { margin: "0 0 6px" } },
+      h("button.btn.small", { onclick: () => listIn.click(),
+        title: "CSV with catalog_id, x, y (or plan_x_m, plan_y_m), optional room, width_m, depth_m, height_m, rotation_deg. " +
+          "It replaces the AI's furniture; items you placed by hand stay." }, "Import furniture list (CSV)"), listIn),
     est && !est.available ? h("p.small.muted", null, est.reason) : null,
     est && est.available ? h("p.small.muted", { style: { margin: "0 0 6px" } },
       `Reads every drawn item on the vector plan in ${est.tiles} high-resolution tiles with ${est.model} ` +
@@ -1256,6 +1277,29 @@ async function fixDialog(target) {
 
 const SAVES_FIRST = "Your unsaved edits are saved as a new version first";
 
+/**
+ * Save after a one-click checklist action, without asking: a burst of clicks within a moment becomes one version.
+ * Edits drawn by hand still wait for "Save version".
+ */
+let autosaveTimer = null;
+const autosaveNotes = [];
+function autosave(note) {
+  autosaveNotes.push(note);
+  clearTimeout(autosaveTimer);
+  autosaveTimer = setTimeout(async () => {
+    const notes = autosaveNotes.splice(0);
+    if (!dirty || !scene) return;
+    const text = [...new Set(notes)].join("; ").slice(0, 900) || "checklist fixes";
+    try {
+      const res = await post(`/api/projects/${state.project.id}/versions`, { scene, parent: loadedVersion, note: text, source: "edit" });
+      dirty = false;
+      await refreshProject();
+      await loadVersion(res.number, true);
+      toast(`Saved as v${res.number}${res.validation.can_generate ? " — ready to build" : ""}. The previous version is kept.`, "ok", 5000);
+    } catch (e) { showError(e, "Saving failed"); }
+  }, 1200);
+}
+
 /** Save unsaved edits as a new version without asking (jobs start from a saved version). */
 async function ensureSaved(note = "edited in review") {
   if (!dirty) return true;
@@ -1301,7 +1345,7 @@ function problemsCtx() {
     const [type, id] = String(t).split(":");
     if (["room", "wall", "opening", "furniture", "hvac_unit", "hvac_terminal", "duct", "sensor"].includes(type)) select({ type, id });
   };
-  return { report, reportError, scene, dirty, version: loadedVersion, select: target, tool: serverTool, edit,
+  return { report, reportError, scene, dirty, version: loadedVersion, select: target, tool: serverTool, edit, autosave,
     solve: runSolve, solveJob, estimate: solveEstimate?.key === key ? solveEstimate.data : null, redraw: drawSide };
 }
 

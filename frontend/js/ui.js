@@ -192,3 +192,28 @@ export function confirmDialog(title, message, okLabel = "Continue", danger = fal
     dlg.showModal();
   });
 }
+
+// ---------------------------------------------------------------------------------------------
+// "It's done" while the user is in another tab or window: a desktop notification (when allowed) and a marked tab title
+// ---------------------------------------------------------------------------------------------
+const BASE_TITLE = document.title;
+document.addEventListener("visibilitychange", () => { if (!document.hidden) document.title = BASE_TITLE; });
+
+/** Ask once, from a click, whether finished work may show a desktop notification. */
+export function askNotifications() {
+  try {
+    if ("Notification" in window && Notification.permission === "default") Notification.requestPermission().catch(() => {});
+  } catch { /* not supported */ }
+}
+
+/** Tell the user something finished, if they are not looking at this page. */
+export function notify(title, body = "") {
+  if (!document.hidden) return;
+  document.title = `● ${title} · ${BASE_TITLE}`;
+  try {
+    if ("Notification" in window && Notification.permission === "granted") {
+      const n = new Notification(title, { body, tag: "twin" });
+      n.onclick = () => { window.focus(); n.close(); };
+    }
+  } catch { /* not supported */ }
+}

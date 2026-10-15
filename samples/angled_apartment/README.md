@@ -20,6 +20,10 @@ Everything is generated from one exact design by `make_reference.py`, so the tru
 
 ## In the app
 
+**Short way:** drop `floor_plan.pdf`, `hvac_plan.pdf` and `furniture_list.csv` on the start page together
+and press **Make the 3D model** (docs/AUTOPILOT.md). The files are sorted by themselves, the furniture list places the
+45 items exactly, and the model is built with the list of what was estimated. Step by step:
+
 1. **New project** "Riverside Apartment 3B", style *Modern*.
 2. **Brief**: overall width **14.25 m**, overall depth **10.25 m** (outer faces; the bay projects another 1.40 m),
    wall height **2.70 m**. Room dimensions you know (clear, wall face to face):
