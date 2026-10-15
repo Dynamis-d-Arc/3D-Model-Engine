@@ -12,6 +12,10 @@ up in Activity and saves its own version; nothing is hidden or overwritten:
     accept          estimated sizes accepted, non-blocking AI questions answered "as drawn"
     build           Blender builds and verifies the model (or the saved model is updated in place)
 
+A *building* run does this for every floor of a multi-floor building (a stack, twin/viewer/stacks.py): one autopilot
+run per floor that is not built yet (the autopilot pool runs two at a time), followed to the end; when every floor
+has a build, the stack resolves and the building opens in the viewer. A floor that needs the user stops only itself.
+
 Review moves from before the build to after it: the finished model comes with the list of what was assumed (and the
 build manifest records every accepted estimate, as for a manual "Accept all"). With ``review_first`` the run stops
 after "fix" so the layout is checked before anything is accepted or built. A run stops early only for what it cannot
@@ -60,6 +64,14 @@ class AutopilotBody(BaseModel):
 
 def plural(n: int, word: str) -> str:
     return f"{n} {word}{'' if n == 1 else 's'}"
+
+
+class BuildingBody(BaseModel):
+    review_first: bool = False
+    use_ai: bool = True
+    furniture: Literal["auto", "detect", "skip"] = "auto"
+    furniture_max_usd: float = Field(default=1.0, ge=0, le=50)
+    rebuild: bool = Field(default=False, description="also run floors whose newest layout is built already")
 
 
 class AutopilotFailed(Exception):
@@ -440,6 +452,9 @@ def register(app: FastAPI, settings: Settings, storage: Storage, jobs: JobManage
     @app.post("/api/projects/{pid}/autopilot", status_code=202)
     def autopilot(pid: str, body: AutopilotBody) -> dict:
         """'Make the 3D model for me': every step from the uploaded drawings to a verified build, as one job."""
+        return start_autopilot(pid, body)
+
+    def start_autopilot(pid: str, body: AutopilotBody) -> dict:
         storage.get_project(pid)
         running = [j for j in storage.active_jobs(pid) if j["kind"] == "autopilot"]
         if running:
@@ -458,11 +473,129 @@ def register(app: FastAPI, settings: Settings, storage: Storage, jobs: JobManage
         return jobs.submit(pid, "autopilot", body.model_dump(),
                            lambda ctx: run_autopilot(ctx, pid, body, plan, start), version=start)
 
+    # ---- a whole multi-floor building --------------------------------------------------------
+    from twin.viewer.stacks import StackError, StackStore, resolve
+    stacks = StackStore(settings.data_dir)
+
+    def floor_built(pid: str) -> dict | None:
+        """The completed build of the floor's newest layout, if there is one."""
+        newest = storage.latest_version(pid)
+        if newest is None:
+            return None
+        return next((b for b in storage.list_builds(pid) if b["status"] == "completed" and b["version"] == newest), None)
+
+    def run_building(ctx: JobContext, sid: str, body: BuildingBody) -> tuple[str, dict]:
+        st = stacks.get(sid)
+        floors = [{"project_id": f["project_id"], "label": f.get("label") or f"Floor {i + 1}", "status": "pending",
+                   "job_id": None, "stage": "", "progress": 0.0, "note": "", "build_id": None, "version": None}
+                  for i, f in enumerate(st["floors"])]
+        out: dict[str, Any] = {"stack_id": sid, "name": st["name"], "floors": floors, "built": 0, "stopped": None}
+
+        def publish() -> None:
+            out["built"] = sum(1 for f in floors if f["status"] == "done")
+            storage.update_job(ctx.job_id, result=out)
+
+        def stopped_by_user() -> bool:
+            with lock:
+                return ctx.job_id in cancelled
+
+        ctx.progress(0.01, "starting the floors")
+        for f in floors:
+            done = floor_built(f["project_id"])
+            if done is not None and not body.rebuild:
+                f.update(status="done", build_id=done["id"], version=done["version"], progress=1.0, note="built already")
+                continue
+            running = [j for j in storage.active_jobs(f["project_id"]) if j["kind"] == "autopilot"]
+            try:
+                job = running[0] if running else start_autopilot(f["project_id"], AutopilotBody(
+                    review_first=body.review_first, use_ai=body.use_ai, furniture=body.furniture,
+                    furniture_max_usd=body.furniture_max_usd))
+            except HTTPException as exc:
+                code, msg = api_message(exc)
+                f.update(status="waiting", note=msg, code=code)
+                continue
+            f.update(status="running", job_id=job["id"], stage="waiting for its turn")
+        publish()
+
+        while any(f["status"] == "running" for f in floors):
+            if stopped_by_user():
+                with lock:   # the floors stop after the step they are on; what they finished is kept
+                    cancelled.update(f["job_id"] for f in floors if f["status"] == "running")
+                for f in floors:
+                    if f["status"] == "running":
+                        f.update(status="stopped", note="stopping after its current step")
+                out["stopped"] = {"code": "STOPPED", "message": "Stopped by you. Every floor keeps what it finished."}
+                publish()
+                return "needs_review", out
+            for f in floors:
+                if f["status"] != "running":
+                    continue
+                j = storage.get_job(f["job_id"])
+                f.update(stage=j.get("stage") or j["status"], progress=j.get("progress") or 0.0)
+                if j["status"] not in ("completed", "needs_review", "failed"):
+                    continue
+                r = j.get("result") or {}
+                if j["status"] == "completed":
+                    f.update(status="done", build_id=r.get("build_id"), version=r.get("version"), progress=1.0,
+                             note="built and verified")
+                elif j["status"] == "failed":
+                    f.update(status="failed", note=(j.get("error") or {}).get("message", "failed"))
+                else:
+                    f.update(status="waiting", version=r.get("version"),
+                             note=(r.get("stopped") or {}).get("message", "needs you"),
+                             code=(r.get("stopped") or {}).get("code"))
+            busy = [f for f in floors if f["status"] == "running"]
+            n_done = sum(1 for f in floors if f["status"] == "done")
+            stage = f"{n_done} of {len(floors)} floors built" + (f"; {busy[0]['label']}: {busy[0]['stage']}" if busy else "")
+            ctx.progress(max(0.02, sum(f["progress"] for f in floors) / len(floors)), stage)
+            publish()
+            time.sleep(POLL_S)
+
+        publish()
+        open_floors = [f for f in floors if f["status"] != "done"]
+        if open_floors:
+            out["stopped"] = {"code": "FLOORS_NEED_YOU", "message": "; ".join(
+                f"{f['label']}: {f['note'] or f['status']}" for f in open_floors)[:900]}
+            publish()
+            return "needs_review", out
+        try:
+            plan = resolve(storage, stacks.get(sid))
+        except StackError as exc:
+            out["stopped"] = {"code": exc.code, "message": str(exc)}
+            publish()
+            return "needs_review", out
+        out["warnings"] = plan["warnings"]
+        publish()
+        return "completed", out
+
+    @app.post("/api/stacks/{sid}/autopilot", status_code=202)
+    def building_autopilot(sid: str, body: BuildingBody) -> dict:
+        """'Make the whole building': the autopilot for every floor that is not built yet, then the stacked building."""
+        try:
+            st = stacks.get(sid)
+        except StackError as exc:
+            raise api_error(404, exc.code, str(exc))
+        running = [j for j in storage.active_jobs(sid) if j["kind"] == "building"]
+        if running:
+            raise api_error(409, "AUTOPILOT_RUNNING", "This building is already being made.", [j["id"] for j in running])
+        for i, f in enumerate(st["floors"]):
+            try:
+                storage.get_project(f["project_id"])
+            except Exception:  # noqa: BLE001 - NotFound
+                raise api_error(404, "FLOOR_NOT_FOUND", f"Floor {i + 1}: project {f['project_id']} does not exist.")
+        return jobs.submit(sid, "building", body.model_dump(), lambda ctx: run_building(ctx, sid, body))
+
+    @app.get("/api/stacks/{sid}/autopilot")
+    def building_autopilot_job(sid: str) -> dict | None:
+        """The newest 'Make the whole building' run of this building (or null)."""
+        return next(iter(storage.list_jobs(sid, limit=1)), None)
+
     @app.post("/api/jobs/{jid}/cancel")
     def cancel_job(jid: str) -> dict:
-        """Stop an autopilot run after the step it is on (that step's own job finishes and is kept)."""
+        """Stop an autopilot run after the step it is on (that step's own job finishes and is kept); a building run
+        stops every floor that way."""
         j = storage.get_job(jid)
-        if j["kind"] != "autopilot":
+        if j["kind"] not in ("autopilot", "building"):
             raise api_error(409, "NOT_STOPPABLE", "Only an autopilot run can be stopped.")
         if j["status"] in ("queued", "processing"):
             with lock:

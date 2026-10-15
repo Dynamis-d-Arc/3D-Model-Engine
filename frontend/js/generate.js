@@ -142,6 +142,8 @@ async function draw() {
   const detail = h("div");
   mount(root, progressEl, h("div.gen-layout", null, h("div", null, detail), h("div.side", null, controls, list)));
   drawProgress();
+  // a build that finished while this project was open (e.g. by a building run) shows instead of "No build yet"
+  if (!state.buildId || !p.builds.some((b) => b.id === state.buildId)) state.buildId = p.builds.find((b) => b.status === "completed")?.id ?? null;
   if (state.buildId) await drawBuild(detail, state.buildId);
   else mount(detail, h("div.card", null, h("h2", null, "No build yet"),
     h("p.muted", null, "Generate a validated version to get the Blender project, the Unreal export and an interactive 3D preview here.")));

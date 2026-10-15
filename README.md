@@ -89,7 +89,9 @@ HVAC drawing, furniture list or sensor sheet CSV, photos; each file is sorted by
 model**. It reads the plan, places the HVAC drawing, furniture and sensors, fixes the problems, accepts the estimates
 and builds the model, then shows what it assumed so you can check it. It only stops for what it cannot decide (a
 blocking question, a problem no fix could solve); **Finish automatically** in the bar continues from there. Tick
-*Let me check the layout before it is built* to review first.
+*Let me check the layout before it is built* to review first. A drawing set with several floors (a multi-page PDF,
+or one plan per floor) becomes one project per floor, stacked as a building; **Make the whole building** builds every
+floor and opens the building in Unreal ([docs/MULTI_FLOOR.md](docs/MULTI_FLOOR.md)).
 
 **Step by step:**
 

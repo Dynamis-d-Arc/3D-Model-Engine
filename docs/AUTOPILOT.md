@@ -16,6 +16,23 @@ Code: `twin/api/autopilot.py` (steps, job, routes), `twin/imaging/classify.py` (
 `twin/scene/furniture_sheet.py` (furniture lists), `twin/scene/review.py` (accepting estimates),
 `frontend/js/autopilot.js`. Tests: `tests/test_autopilot.py`.
 
+## A whole building
+
+Drop a drawing set whose floor plans name two or more floors and the start page makes one project per floor, stacked
+as a multi-floor building ([MULTI_FLOOR.md](MULTI_FLOOR.md)). Every floor's Brief & files then offers **Make the whole
+building**: a `building` job (its own pool) that starts this autopilot for every floor whose newest layout has no
+build (two at a time, as the autopilot pool allows), follows them, and ends `completed` when every floor is built and
+the stack resolves, or `needs_review` with each floor's state (`FLOORS_NEED_YOU`). **Stop** stops every floor after
+the step it is on. Floors that need the user stop only themselves; **Make the whole building** again picks up where
+they are (built floors are kept).
+
+Which floor a sheet shows (`twin/imaging/drawing_set.py`): a level named on a title line ("LEVEL 2 FLOOR PLAN",
+"LVL 3 ACMV LAYOUT", "2ND STOREY PLAN", "GROUND FLOOR PLAN", "BASEMENT 1", "ROOF PLAN"), else the only level the
+sheet names; a sheet that names several without a title (a section) has none. Single-sheet files also go by their
+name (`L2_plan.pdf`, `GF.pdf`, `B1 plan.png`). Each floor gets its best plan sheet (a vector PDF before an image), the
+HVAC drawings and CSV sheets of the same level, and every photo; a set whose plans name fewer than two floors is one
+project, as before.
+
 ## What the user does
 
 | Before | Now |
@@ -75,7 +92,9 @@ in use is the one the user picked, else the newest vector PDF (it carries the sc
 |---|---|
 | `GET /api/projects/{p}/autopilot/plan?review_first=&furniture=&fresh=` | the steps a run would take, with the reason for each it leaves out; `blocked` when it cannot start |
 | `POST /api/projects/{p}/autopilot` `{review_first, furniture: auto\|detect\|skip, furniture_max_usd, use_ai, fresh, from_version, plan_file_id, reference_file_ids}` | job `autopilot`; `completed` with `build_id`, or `needs_review` with `stopped` |
-| `POST /api/jobs/{j}/cancel` | stop an autopilot run after its current step |
+| `POST /api/jobs/{j}/cancel` | stop an autopilot run after its current step (a building run: every floor) |
+| `POST /api/drawing-sets` (multipart `files`) | what the start page sends: one project, or one per floor + the stack |
+| `POST /api/stacks/{s}/autopilot`, `GET` the same | "Make the whole building" (job `building`), the newest run |
 | `POST /api/projects/{p}/files` `kind=auto`, `page=0` | sorted upload (also `furniture_list`, `sensor_sheet`) |
 | `POST /api/scene/import-furniture` `{scene, text, replace}` | furniture list into an unsaved scene (Review → Furniture → Import furniture list) |
 

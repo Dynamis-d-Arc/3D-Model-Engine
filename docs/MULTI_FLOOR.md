@@ -11,13 +11,26 @@ Tests: `tests/test_stacks.py` (automated), the stack tour in `tests/test_unreal_
 
 ## Making one
 
-Web app: **Generate & preview → Unreal Engine 5 → Multi-floor building → + Multi-floor building**: a name and the
+**From a drawing set (automatic).** Drop the whole set on the start page: a multi-page PDF and / or one file per
+floor, with the HVAC drawings, furniture lists, sensor sheets and photos. When the floor plans name two or more floors
+(their titles, "LEVEL 2 FLOOR PLAN", "2ND STOREY", "GROUND FLOOR", "BASEMENT 1", or file names such as `L2_plan.pdf`),
+every floor becomes its own project with its plan page, the HVAC drawings and CSV sheets that name the same floor and
+every photo, and the floors are stacked bottom to top as one building named after the set. **Make the whole building**
+(on any floor's Brief & files) then runs the autopilot for every floor that is not built yet, two at a time, and the
+building opens in the viewer as soon as every floor is built. A floor that needs the user stops only itself; the rest
+carry on. Sheets that name no floor (or several, like a section) are listed, never guessed. Code:
+`twin/imaging/drawing_set.py`, `POST /api/drawing-sets`, the building run in `twin/api/autopilot.py`; tests:
+`tests/test_buildings.py`. See [AUTOPILOT.md](AUTOPILOT.md).
+
+**By hand.** **Generate & preview → Unreal Engine 5 → Multi-floor building → + Multi-floor building**: a name and the
 floors, lowest first. Every floor needs a completed build. API:
 
 | | |
 |---|---|
 | `POST /api/stacks` | `{"name", "floors": [{"project_id", "build_id"?, "label"?, "elevation_m"?, "offset_m"?: [dx, dy]}]}` |
 | `GET /api/stacks[?project_id=]`, `GET/PUT/DELETE /api/stacks/{sid}` | the definition + the resolved plan (or `plan_error`) |
+| `POST /api/drawing-sets` (multipart `files`, optional `name`) | a dropped set: `{"kind": "single", "project"}` or `{"kind": "building", "stack", "floors", "unassigned"}` |
+| `POST /api/stacks/{sid}/autopilot` `{review_first, use_ai, furniture, furniture_max_usd, rebuild}` | job `building`: the autopilot for every floor not built yet; `GET` the same path = the newest run |
 | `POST /api/stacks/{sid}/viewer/launch` | a `.twinview` link for the whole building (token scoped to the stack and its floor projects) |
 
 A floor without `build_id` follows its project's newest completed build. Definitions are small JSON files in

@@ -31,6 +31,7 @@ from twin.blender.runner import blender_version
 from twin.config import PROJECT_ROOT, Settings, get_settings, install_log_redaction
 from twin.fixtures import load_sample_apartment
 from twin.imaging.classify import csv_kind, image_kind, is_csv_text, pdf_kind, pick_pdf_page
+from twin.imaging.drawing_set import analyse as analyse_set, building_name
 from twin.imaging.pdf_text import calibration_for, extract_pdf_text
 from twin.imaging.preprocess import UploadRejected, normalize_upload
 from twin.layers import run_layer_build
@@ -48,9 +49,10 @@ from twin.scene.model import (Brief, Certainty, Level, ProjectMeta, Provenance, 
 from twin.scene.styles import BUILTIN_MATERIALS, STYLES
 from twin.scene.review import accept_estimates as accept_all_estimates
 from twin.scene.validate import validate_scene
-from twin.viewer.stacks import StackStore
+from twin.viewer.stacks import FloorSpec, StackSpec, StackStore
 
 log = logging.getLogger("twin.api")
+MAX_SET_FILES = 40   # files in one drop on the start page
 FRONTEND_DIR = PROJECT_ROOT / "frontend"
 
 
@@ -356,7 +358,9 @@ def create_app(settings: Settings | None = None, ai_transport=None) -> FastAPI:
             raise ApiError(413, "UPLOAD_TOO_LARGE", f"Files are limited to {settings.max_upload_mb} MB.")
         if not data:
             raise ApiError(400, "UPLOAD_EMPTY", "The uploaded file is empty.")
-        name = file.filename or "upload"
+        return store_upload(pid, file.filename or "upload", data, kind, page)
+
+    def store_upload(pid: str, name: str, data: bytes, kind: str, page: int) -> dict:
         fid = new_id("f")
         folder = storage.upload_dir(pid, fid)
         why = page_why = None
@@ -401,6 +405,59 @@ def create_app(settings: Settings | None = None, ai_transport=None) -> FastAPI:
         record["classified"] = why
         record["page_reason"] = page_why if norm.pages > 1 else None
         return record
+
+    def create_from_set(files: list[tuple[str, bytes]], name: str | None) -> dict:
+        ds = analyse_set(files)
+        if not ds.is_building:
+            first = next((n for n, _ in files if n.lower().endswith(".pdf")), files[0][0])
+            stem = " ".join(Path(first).stem.replace("_", " ").replace("-", " ").split())
+            p = storage.create_project((name or stem[:1].upper() + stem[1:] or "My building")[:120], Brief())
+            out = []
+            for fname, data in files:
+                try:
+                    out.append(store_upload(p["id"], fname, data, "auto", 0))
+                except ApiError as exc:
+                    out.append({"original_name": fname, "error": exc.detail})
+            return {"kind": "single", "project": storage.get_project(p["id"]), "files": out}
+        title = name or building_name([n for n, _ in files])
+        refs = [s for s in ds.sheets if s.kind == "reference"]
+        floors, specs = [], []
+        for fl in ds.floors:
+            p = storage.create_project(f"{title} · {fl['label']}"[:120], Brief())
+            put = lambda sh, kind: store_upload(p["id"], sh.name, files[sh.file][1], kind, sh.page + 1)  # noqa: E731
+            recs = [put(fl["plan"], "plan")]
+            for sh in fl["hvac"]:
+                recs.append(put(sh, "hvac"))
+            for sh in fl["sheets"] + refs:
+                try:
+                    recs.append(put(sh, sh.kind))
+                except ApiError as exc:
+                    recs.append({"original_name": sh.name, "error": exc.detail})
+            specs.append(FloorSpec(project_id=p["id"], label=fl["label"][:40]))
+            floors.append({"label": fl["label"], "project_id": p["id"], "files": recs})
+        stack = StackStore(settings.data_dir).create(StackSpec(name=title, floors=specs))
+        return {"kind": "building", "stack": stack, "floors": floors,
+                "unassigned": [sh.public() for sh in ds.unassigned]}
+
+    @app.post("/api/drawing-sets", status_code=201)
+    async def drawing_set(files: list[UploadFile] = File(...), name: str | None = Form(None)) -> dict:
+        """Everything dropped on the start page. One project, or, when the floor plans name two or more floors
+        ("LEVEL 2 FLOOR PLAN", "L3_plan.pdf"), one project per floor with its own plan page, HVAC drawings and
+        sheets, stacked as a multi-floor building (docs/AUTOPILOT.md)."""
+        from starlette.concurrency import run_in_threadpool
+        if not files or len(files) > MAX_SET_FILES:
+            raise ApiError(400, "TOO_MANY_FILES", f"Drop between 1 and {MAX_SET_FILES} files at a time.")
+        limit = settings.max_upload_mb * 1024 * 1024
+        got = []
+        for f in files:
+            data = await f.read(limit + 1)
+            if len(data) > limit:
+                raise ApiError(413, "UPLOAD_TOO_LARGE", f"{f.filename}: files are limited to {settings.max_upload_mb} MB.")
+            if data:
+                got.append((f.filename or "upload", data))
+        if not got:
+            raise ApiError(400, "UPLOAD_EMPTY", "The dropped files are empty.")
+        return await run_in_threadpool(create_from_set, got, (name or "").strip()[:120] or None)
 
     @app.get("/api/projects/{pid}/files/{fid}/{variant}")
     def file_content(pid: str, fid: str, variant: Literal["original", "normalized", "thumb"]):

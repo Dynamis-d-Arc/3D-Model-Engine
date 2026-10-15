@@ -1,9 +1,9 @@
 // @ts-check
-import { del, get, post } from "./api.js";
+import { del, get, post, upload } from "./api.js";
 import { state, emit, on } from "./state.js";
 import { h, mount, ask, showError, toast, confirmDialog, notify, isRunningJob } from "./ui.js";
-import { renderBrief, dropzone, uploadFiles } from "./brief.js";
-import { latestRun, resume, startAutopilot } from "./autopilot.js";
+import { renderBrief, dropzone } from "./brief.js";
+import { buildingRun, currentBuilding, latestRun, resume, startAutopilot, startBuilding } from "./autopilot.js";
 import { renderReview } from "./editor.js";
 import { renderGenerate } from "./generate.js";
 import { renderActivity } from "./activity.js";
@@ -71,7 +71,7 @@ function renderProjectSelect() {
     state.projects.map((p) => h("option", { value: p.id, selected: state.project?.id === p.id }, `${p.name}  ·  ${p.status}`)));
 }
 
-async function openProject(pid) {
+export async function openProject(pid) {
   if (!pid) {
     state.project = null;
     emit("project", null);
@@ -89,18 +89,35 @@ async function openProject(pid) {
   }
 }
 
-/** Files dropped before any project exists: a project named after them, the files sorted into it, ready to make. */
+/**
+ * Files dropped before any project exists. The server sorts them: one project with the files in it, or, when the
+ * floor plans name two or more floors, one project per floor stacked as a multi-floor building.
+ */
 async function startFromFiles(files) {
-  const main = files.find((f) => /\.pdf$/i.test(f.name)) || files.find((f) => /\.(png|jpe?g)$/i.test(f.name)) || files[0];
-  const name = main.name.replace(/\.[^.]+$/, "").replace(/[_\-.]+/g, " ").replace(/\s+/g, " ").trim();
+  const form = new FormData();
+  for (const f of files) form.append("files", f);
+  const zone = document.querySelector("#emptyDrop .dropzone");
+  if (zone) mount(zone, h("span.spinner"), ` Reading ${files.length} file${files.length > 1 ? "s" : ""}…`);
   try {
-    const p = await post("/api/projects", { name: (name.charAt(0).toUpperCase() + name.slice(1)).slice(0, 120) || "My building" });
-    await uploadFiles(p.id, files);
+    const r = await upload("/api/drawing-sets", form);
     state.projects = await get("/api/projects");
     renderProjectSelect();
-    await openProject(p.id);
+    if (r.kind === "building") {
+      await openProject(r.floors[0].project_id);
+      toast(h("div", null, `Found a building with ${r.floors.length} floors: ${r.floors.map((f) => f.label).join(", ")}. `,
+        `Each floor is its own project, stacked as ${r.stack.name}.`,
+        r.unassigned.length ? h("div", null, `Not assigned to a floor: ${r.unassigned.map((s) => s.name + (s.pages > 1 ? ` p.${s.page}` : "")).join(", ")}.`) : null),
+        "ok", 12000);
+    } else {
+      await openProject(r.project.id);
+      const ok = r.files.filter((f) => !f.error);
+      toast(`Added ${ok.length} file${ok.length === 1 ? "" : "s"}` + (ok.length < r.files.length ? `; ${r.files.length - ok.length} could not be read` : "") + ".", "ok", 6000);
+    }
     switchTab("brief");
-  } catch (e) { showError(e, "Could not create the project"); }
+  } catch (e) {
+    showError(e, "Could not read the files");
+    if (zone) mount(zone, "Drop your drawings here to start: floor plan, HVAC drawing, furniture list, photos");
+  }
 }
 
 async function newProject() {
@@ -156,13 +173,16 @@ function projectProgress(p) {
   // a job left "processing" by a server restart must not hold the bar forever
   const running = p.jobs?.find((j) => ["queued", "processing"].includes(j.status) && Date.now() / 1000 - j.created_at < 3600);
   const ap = latestRun();
-  const apRunning = isRunningJob(ap);
+  const bj = buildingRun();
+  const apRunning = isRunningJob(ap) || isRunningJob(bj);
   const counts = v?.counts || {};
   const blocking = (counts.error || 0) + (counts.review || 0);
   const done = { brief: !!v, review: !!v?.can_generate, generate: !!built };
   const aiOn = !!state.health?.ai?.configured;
   let msg, action = null, tab = null, cls = "", auto = null;
-  if (apRunning) {
+  if (isRunningJob(bj)) {
+    msg = `Making the building${bj.stage ? `: ${bj.stage}` : "…"} You can leave this page; it tells you when it is done.`;
+  } else if (apRunning) {
     msg = `Making your 3D model${ap.stage ? `: ${ap.stage}` : "…"} You can leave this page; it tells you when it is done.`;
   } else if (running) {
     msg = `Working: ${JOB_LABELS[running.kind] || running.kind}${running.stage ? ` (${running.stage})` : ""}…`;
@@ -171,7 +191,9 @@ function projectProgress(p) {
     action = "Add drawings"; tab = "brief";
   } else if (!v) {
     msg = aiOn ? "Your drawings are in. One click reads them and builds the 3D model." : "Your plan is uploaded. Set up the AI to read it, or trace it by hand.";
-    if (aiOn) auto = { label: "Make the 3D model", title: "Read the plan, fix the problems, accept the estimates and build the model" };
+    const whole = currentBuilding();
+    if (aiOn) auto = whole ? { label: "Make the whole building", building: true, title: `Read and build all ${whole.floors.length} floors of ${whole.name}, then stack them` }
+      : { label: "Make the 3D model", title: "Read the plan, fix the problems, accept the estimates and build the model" };
     else { action = "Other ways to start"; tab = "brief"; }
   } else if (!v.can_generate) {
     const stopped = ap?.result?.stopped && ap.result.version === v.number ? ap.result.stopped : null;
@@ -189,7 +211,7 @@ function projectProgress(p) {
   return { msg, action, tab, done, cls, running: !!running || apRunning, built, auto, apRunning };
 }
 
-export const JOB_LABELS = { autopilot: "making the 3D model", interpret: "the AI is reading the plan", fix: "the AI is changing the layout", solve: "fixing problems",
+export const JOB_LABELS = { autopilot: "making the 3D model", building: "making the building", interpret: "the AI is reading the plan", fix: "the AI is changing the layout", solve: "fixing problems",
   furniture: "detecting furniture", build: "building the 3D model", layer_build: "updating the 3D model",
   unreal_import: "preparing the Unreal scene", hvac_import: "reading the HVAC drawing", redesign: "redesigning a room" };
 
@@ -210,7 +232,7 @@ function renderNextStep() {
     st.running ? h("span.spinner", { title: "working" }) : null,
     h("div.msg", null, st.msg),
     st.apRunning && state.activeTab !== "brief" ? h("button.btn.small", { onclick: () => switchTab("brief"), title: "See every step" }, "Details") : null,
-    st.auto ? h("button.btn.primary.small", { title: st.auto.title, onclick: () => startAutopilot() }, st.auto.label) : null,
+    st.auto ? h("button.btn.primary.small", { title: st.auto.title, onclick: () => (st.auto.building ? startBuilding() : startAutopilot()) }, st.auto.label) : null,
     st.built && state.health?.desktop_viewer?.available
       ? h("button.btn.primary.small", { title: "Walk through the newest 3D model in Unreal Engine on this PC", onclick: () => viewInUnreal(p, st.built) },
         "View in Unreal Engine") : null,
