@@ -25,11 +25,12 @@ from twin.ai.budget import BudgetGuard
 from twin.ai.client import AIClient, AIError, AIResult
 from twin.ai.interpret import interpret_plan, outcome_from_response, redesign_room
 from twin.api.jobs import JobContext, JobManager
-from twin.api.storage import NotFound, Storage, new_id
+from twin.api.storage import InUse, NotFound, Storage, new_id
 from twin.assets.catalog import load_catalog
 from twin.blender.runner import blender_version
 from twin.config import PROJECT_ROOT, Settings, get_settings, install_log_redaction
 from twin.fixtures import load_sample_apartment
+from twin.imaging.classify import csv_kind, image_kind, is_csv_text, pdf_kind, pick_pdf_page
 from twin.imaging.pdf_text import calibration_for, extract_pdf_text
 from twin.imaging.preprocess import UploadRejected, normalize_upload
 from twin.layers import run_layer_build
@@ -39,12 +40,15 @@ from twin.scene import derive
 from twin.scene import problems as problem_info
 from twin.scene.compile import scene_hash
 from twin.scene.diff import change_summary, diff_scenes
+from twin.scene.furniture_sheet import import_furniture_sheet
 from twin.scene.sensors import (KIND_COLORS, KIND_LABELS, KIND_UNITS, SHEET_TEMPLATE, TAG_PREFIX, geometry_key,
                                 import_sheet, layer_changes)
-from twin.scene.model import (Brief, Certainty, Level, NEEDS_REVIEW_STATUSES, ProjectMeta, Provenance, Room, Scene,
-                              Wall, scene_json_schema)
+from twin.scene.model import (Brief, Certainty, Level, ProjectMeta, Provenance, Room, Scene, Wall,
+                              scene_json_schema)
 from twin.scene.styles import BUILTIN_MATERIALS, STYLES
+from twin.scene.review import accept_estimates as accept_all_estimates
 from twin.scene.validate import validate_scene
+from twin.viewer.stacks import StackStore
 
 log = logging.getLogger("twin.api")
 FRONTEND_DIR = PROJECT_ROOT / "frontend"
@@ -122,6 +126,16 @@ class BuildBody(BaseModel):
 class SensorSheetBody(BaseModel):
     scene: dict
     text: str = Field(max_length=2_000_000, description="CSV placement sheet")
+
+
+class FurnitureSheetBody(BaseModel):
+    scene: dict
+    text: str = Field(max_length=2_000_000, description="CSV furniture list")
+    replace: bool = Field(default=True, description="the list replaces the AI's furniture (items placed by hand stay)")
+
+
+class FilePatch(BaseModel):
+    kind: Literal["plan", "reference", "hvac"]
 
 
 class RedesignBody(BaseModel):
@@ -223,6 +237,13 @@ def create_app(settings: Settings | None = None, ai_transport=None) -> FastAPI:
         return JSONResponse({"error": {"code": "NOT_FOUND", "message": f"Not found: {exc.args[0]}", "detail": None}},
                             status_code=404)
 
+    @app.exception_handler(InUse)
+    async def in_use(_req: Request, exc: InUse):
+        return JSONResponse({"error": {"code": "FILES_IN_USE", "detail": exc.args[0],
+                                       "message": "Some of these files are open in another program (for example Blender, "
+                                                  "a viewer or File Explorer). Close it and try again. Nothing was deleted."}},
+                            status_code=409)
+
     from fastapi.exceptions import RequestValidationError
 
     @app.exception_handler(RequestValidationError)
@@ -295,10 +316,39 @@ def create_app(settings: Settings | None = None, ai_transport=None) -> FastAPI:
     def patch_project(pid: str, body: ProjectPatch) -> dict:
         return storage.update_project(pid, name=body.name, brief=body.brief)
 
+    def ensure_idle(pid: str) -> None:
+        """Deleting under a running job would pull its files away mid-way: refuse until it has finished."""
+        running = storage.active_jobs(pid)
+        if running:
+            kinds = ", ".join(sorted({j["kind"].replace("_", " ") for j in running}))
+            raise ApiError(409, "PROJECT_BUSY", f"This project still has work running ({kinds}). Wait for it to "
+                                                "finish, then try again.", [j["id"] for j in running])
+
+    @app.delete("/api/projects/{pid}")
+    def delete_project(pid: str) -> dict:
+        """Delete a project with all its files, versions and builds. Cannot be undone."""
+        storage.get_project(pid)
+        ensure_idle(pid)
+        buildings = [s["name"] for s in StackStore(settings.data_dir).list()
+                     if any(f["project_id"] == pid for f in s["floors"])]
+        if buildings:
+            raise ApiError(409, "PROJECT_IN_BUILDING", f"This project is a floor of the multi-floor building "
+                                                       f"{', '.join(repr(n) for n in buildings)}. Take it out of the "
+                                                       "building (Generate & preview, Multi-floor building) first.",
+                           buildings)
+        for s in list(app.state.streamer.sessions.values()):   # streamed walkthroughs of this project end now
+            if s.project_id == pid and s.proc.poll() is None:
+                app.state.streamer.stop(s.id)
+        storage.delete_project(pid)
+        return {"deleted": pid}
+
     # ---- uploads -----------------------------------------------------------------------------
     @app.post("/api/projects/{pid}/files", status_code=201)
-    async def upload(pid: str, file: UploadFile = File(...), kind: Literal["plan", "reference", "hvac"] = Form(...),
-                     page: int = Form(1)) -> dict:
+    async def upload(pid: str, file: UploadFile = File(...),
+                     kind: Literal["auto", "plan", "reference", "hvac", "furniture_list", "sensor_sheet"] = Form(...),
+                     page: int = Form(1, description="PDF page (1-based); 0 = pick the page automatically")) -> dict:
+        """Store an upload. kind=auto sorts it (floor plan, HVAC drawing, reference image, furniture list or sensor
+        sheet) from its content and name; `classified` says what it was taken for and why."""
         storage.get_project(pid)
         limit = settings.max_upload_mb * 1024 * 1024
         data = await file.read(limit + 1)
@@ -306,14 +356,33 @@ def create_app(settings: Settings | None = None, ai_transport=None) -> FastAPI:
             raise ApiError(413, "UPLOAD_TOO_LARGE", f"Files are limited to {settings.max_upload_mb} MB.")
         if not data:
             raise ApiError(400, "UPLOAD_EMPTY", "The uploaded file is empty.")
+        name = file.filename or "upload"
         fid = new_id("f")
         folder = storage.upload_dir(pid, fid)
+        why = page_why = None
+        if kind in ("furniture_list", "sensor_sheet") or (kind == "auto" and is_csv_text(data)):
+            found, why = csv_kind(data)
+            if found is None or (kind != "auto" and found != kind):
+                raise ApiError(415, "UPLOAD_REJECTED", f"{name} is {why}." if found else f"{name}: {why}.")
+            folder.mkdir(parents=True, exist_ok=True)
+            (folder / "original.csv").write_bytes(data)
+            record = storage.add_file(pid, fid, found, name, "csv", data, 0, 0, 1, 0)
+            return {**record, "classified": why if kind == "auto" else None}
+        if page <= 0 and data[:1024].lstrip()[:5] == b"%PDF-":
+            try:
+                want = "hvac" if kind == "hvac" or (kind == "auto" and pdf_kind(data, name, 0)[0] == "hvac") else "plan"
+                page, page_why = pick_pdf_page(data, want)
+                page += 1
+            except Exception:  # noqa: BLE001 - a broken PDF is reported by normalize_upload below
+                page = 1
         try:
             norm = normalize_upload(data, folder, page=max(0, page - 1))
         except UploadRejected as exc:
             raise ApiError(415, "UPLOAD_REJECTED", str(exc))
+        if kind == "auto":
+            kind, why = pdf_kind(data, name, norm.page) if norm.kind == "pdf" else image_kind(data, name)
         (folder / f"original.{norm.kind}").write_bytes(data)
-        record = storage.add_file(pid, fid, kind, file.filename or "upload", norm.kind, data, norm.width, norm.height,
+        record = storage.add_file(pid, fid, kind, name, norm.kind, data, norm.width, norm.height,
                                   norm.pages, norm.page)
         if norm.kind == "pdf":
             # exact vector text + drawing scale: labels in metres for the AI, automatic underlay calibration
@@ -329,6 +398,8 @@ def create_app(settings: Settings | None = None, ai_transport=None) -> FastAPI:
                     record = storage.set_calibration(pid, fid, cal)
                 record["pdf_scale"] = info["scale"]
                 record["pdf_labels"] = info["label_count"]
+        record["classified"] = why
+        record["page_reason"] = page_why if norm.pages > 1 else None
         return record
 
     @app.get("/api/projects/{pid}/files/{fid}/{variant}")
@@ -340,9 +411,33 @@ def create_app(settings: Settings | None = None, ai_transport=None) -> FastAPI:
             raise ApiError(404, "FILE_MISSING", "The stored file is missing.")
         return FileResponse(path, filename=meta["original_name"] if variant == "original" else None)
 
+    @app.patch("/api/projects/{pid}/files/{fid}")
+    def patch_file(pid: str, fid: str, body: FilePatch) -> dict:
+        """Change what an upload is used as (when the automatic sorting got it wrong)."""
+        meta = storage.get_file(pid, fid)
+        if meta["sniffed"] == "csv":
+            raise ApiError(409, "FILE_KIND_FIXED", "A CSV sheet is always a furniture list or a sensor sheet.")
+        if body.kind == "hvac" and meta["sniffed"] != "pdf":
+            raise ApiError(415, "HVAC_NOT_PDF", "An HVAC drawing must be a vector PDF exported from CAD.")
+        storage.set_file_kind(pid, fid, body.kind)
+        info_file = storage.upload_dir(pid, fid) / "pdf_text.json"
+        if body.kind == "plan" and not meta["calibration"] and info_file.is_file():
+            cal = calibration_for(json.loads(info_file.read_text(encoding="utf-8")), meta["width"])
+            if cal:
+                storage.set_calibration(pid, fid, cal)
+        return storage.get_file(pid, fid)
+
     @app.put("/api/projects/{pid}/files/{fid}/calibration")
     def calibration(pid: str, fid: str, body: CalibrationBody) -> dict:
         return storage.set_calibration(pid, fid, body.calibration)
+
+    @app.delete("/api/projects/{pid}/files/{fid}")
+    def delete_file(pid: str, fid: str) -> dict:
+        """Delete an uploaded plan, HVAC drawing or reference image. Saved versions and builds are kept."""
+        storage.get_file(pid, fid)
+        ensure_idle(pid)
+        storage.delete_file(pid, fid)
+        return {"deleted": fid}
 
     # ---- scene versions ----------------------------------------------------------------------
     def store_version(pid: str, scene: Scene, source: str, note: str, parent: int | None) -> dict:
@@ -451,21 +546,19 @@ def create_app(settings: Settings | None = None, ai_transport=None) -> FastAPI:
     def accept_estimates(body: SceneBody) -> dict:
         """Mark every remaining estimated/extracted value as a knowingly accepted estimate."""
         data = parse_scene(body.scene).model_dump(mode="json")
-        changed = 0
-        groups = [data[c] for c in ("levels", "rooms", "walls", "openings", "furniture", "sensors")]
-        groups += [data["hvac"][c] for c in ("units", "terminals", "ducts")]
-        for coll in groups:
-            for el in coll:
-                if el["certainty"]["status"] in NEEDS_REVIEW_STATUSES:
-                    el["certainty"]["status"] = "accepted_estimate"
-                    changed += 1
-        return {"scene": data, "changed": changed}
+        return {"scene": data, "changed": len(accept_all_estimates(data))}
 
     @app.post("/api/scene/import-sensors")
     def import_sensors(body: SensorSheetBody) -> dict:
         """Merge a CSV sensor placement sheet into the scene (not saved: the editor shows the result as
         unsaved edits to check before saving a new version)."""
         scene, info = import_sheet(parse_scene(body.scene), body.text)
+        return {"scene": scene.model_dump(mode="json"), **info}
+
+    @app.post("/api/scene/import-furniture")
+    def import_furniture(body: FurnitureSheetBody) -> dict:
+        """Merge a CSV furniture list into the scene (not saved: the editor shows it as an edit to save)."""
+        scene, info = import_furniture_sheet(parse_scene(body.scene), body.text, body.replace)
         return {"scene": scene.model_dump(mode="json"), **info}
 
     @app.get("/api/sensors/template.csv", include_in_schema=False)
@@ -508,7 +601,7 @@ def create_app(settings: Settings | None = None, ai_transport=None) -> FastAPI:
         brief = storage.brief(pid)
 
         def run(ctx: JobContext) -> tuple[str, dict]:
-            ctx.progress(0.1, "sending plan to the AI model")
+            ctx.progress(0.1, f"waiting for {settings.ai.model} to read the plan")
             client = ai_client(ctx, "interpret")
             info = None
             if plan_meta:
@@ -944,8 +1037,20 @@ def create_app(settings: Settings | None = None, ai_transport=None) -> FastAPI:
                 "budget": budget().status()}
 
     # ---- HVAC drawing import, live data, airflow model ----------------------------------------
-    from twin.hvac.routes import register as register_hvac
-    register_hvac(app, settings, storage, jobs, store_version, ApiError)
+    from twin.hvac.routes import HvacImportBody, register as register_hvac
+    hvac_import = register_hvac(app, settings, storage, jobs, store_version, ApiError)
+
+    # ---- autopilot: every step from the drawings to a verified build as one job --------------
+    from twin.api.autopilot import Actions, register as register_autopilot
+    register_autopilot(app, settings, storage, jobs, Actions(
+        interpret=lambda pid, plan, refs: interpret(pid, InterpretBody(plan_file_id=plan, reference_file_ids=refs)),
+        detect_furniture=lambda pid, n: detect_furniture_job(pid, n, FurnitureBody()),
+        furniture_estimate=detect_furniture_estimate,
+        hvac_import=lambda pid, n, fid: hvac_import(pid, n, HvacImportBody(file_id=fid)),
+        solve=lambda pid, n, use_ai: solve(pid, n, SolveBody(use_ai=use_ai)),
+        build=lambda pid, n: build(pid, n, BuildBody(mode="auto", render_previews=settings.render_previews)),
+        store_version=store_version, require_ai=require_ai, ai_spent=lambda: budget().spent(),
+        blender_ok=lambda: bool(settings.blender_path and Path(settings.blender_path).is_file())), ApiError)
 
     # ---- read-only API of the packaged Unreal viewer (token-protected) -------------------------
     from twin.viewer.routes import register as register_viewer
@@ -963,6 +1068,15 @@ def create_app(settings: Settings | None = None, ai_transport=None) -> FastAPI:
         pass
 
     # ---- frontend ----------------------------------------------------------------------------
+    @app.middleware("http")
+    async def revalidate_frontend(request: Request, call_next):
+        response = await call_next(request)
+        if request.url.path.startswith("/app"):
+            # the browser asks for a newer file on every load (304 when unchanged), so an updated module is never
+            # served stale from its heuristic cache
+            response.headers["Cache-Control"] = "no-cache"
+        return response
+
     if FRONTEND_DIR.is_dir():
         three = FRONTEND_DIR / "node_modules" / "three"
         if three.is_dir():

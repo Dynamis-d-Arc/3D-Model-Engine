@@ -65,6 +65,14 @@ def test_health_never_exposes_key(tmp_path):
     assert FAKE_KEY not in json.dumps(body)
 
 
+def test_frontend_files_are_revalidated(tmp_path):
+    c = make_client(tmp_path)
+    for path in ("/app/", "/app/js/editor.js"):
+        r = c.get(path)
+        assert r.status_code == 200 and r.headers["cache-control"] == "no-cache", path
+    assert "cache-control" not in c.get("/api/health").headers
+
+
 def test_uploads_png_jpg_pdf_and_rejections(tmp_path):
     import fitz
     c = make_client(tmp_path)

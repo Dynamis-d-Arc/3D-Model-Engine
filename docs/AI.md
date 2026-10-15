@@ -25,7 +25,7 @@ image + strict-JSON request to confirm the configured model supports both.
 | Variable | Notes |
 |---|---|
 | `TWIN_AI_BUDGET_USD` | hard cap on total AI spend (all projects, all time, probe included); this install: **$10** |
-| `TWIN_AI_PRICE_INPUT_PER_1M` / `TWIN_AI_PRICE_OUTPUT_PER_1M` | model prices (USD per 1M tokens, Standard tier); required when a cap is set |
+| `TWIN_AI_PRICE_INPUT_PER_1M` / `TWIN_AI_PRICE_OUTPUT_PER_1M` | model prices (USD per 1M tokens, Standard tier); required when a cap is set, unless the model is in `MODEL_PRICES` (`twin/config.py`, published prices with the date they were checked); a set value always wins |
 | `TWIN_AI_SERVICE_TIER` | `default`: pins requests to Standard pricing (OpenAI's "Fast" tier costs 2x) |
 
 * Before every HTTP attempt the worst case is **reserved**: conservative input estimate (3 chars/token,

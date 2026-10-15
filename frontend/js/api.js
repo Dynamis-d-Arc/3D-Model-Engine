@@ -39,6 +39,7 @@ export const get = (p) => api(p);
 export const post = (p, json) => api(p, { method: "POST", json: json ?? {} });
 export const patch = (p, json) => api(p, { method: "PATCH", json });
 export const put = (p, json) => api(p, { method: "PUT", json });
+export const del = (p) => api(p, { method: "DELETE" });
 
 /** @param {string} path @param {FormData} form */
 export async function upload(path, form) {

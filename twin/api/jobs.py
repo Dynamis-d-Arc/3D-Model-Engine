@@ -20,10 +20,11 @@ from twin.pipeline import BuildFailed
 
 log = logging.getLogger("twin.jobs")
 
-POOLS = {"ai": 2, "blender": 1, "unreal": 1, "hvac": 1, "layer": 2}
-# layer builds (sensor updates of a saved model) never wait behind a Blender build
+POOLS = {"ai": 2, "blender": 1, "unreal": 1, "hvac": 1, "layer": 2, "autopilot": 2}
+# layer builds (sensor updates of a saved model) never wait behind a Blender build; an autopilot run only waits for
+# the jobs it starts in the other pools, so it has a pool of its own
 KIND_POOL = {"interpret": "ai", "redesign": "ai", "fix": "ai", "solve": "ai", "furniture": "ai", "build": "blender", "unreal_import": "unreal",
-             "hvac_import": "hvac", "layer_build": "layer"}
+             "hvac_import": "hvac", "layer_build": "layer", "autopilot": "autopilot"}
 
 
 @dataclass

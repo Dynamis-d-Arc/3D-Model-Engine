@@ -1,8 +1,9 @@
 // @ts-check
-import { get, post } from "./api.js";
+import { del, get, post } from "./api.js";
 import { state, emit, on } from "./state.js";
-import { h, mount, ask, showError, toast } from "./ui.js";
-import { renderBrief } from "./brief.js";
+import { h, mount, ask, showError, toast, confirmDialog, notify, isRunningJob } from "./ui.js";
+import { renderBrief, dropzone, uploadFiles } from "./brief.js";
+import { latestRun, resume, startAutopilot } from "./autopilot.js";
 import { renderReview } from "./editor.js";
 import { renderGenerate } from "./generate.js";
 import { renderActivity } from "./activity.js";
@@ -16,12 +17,19 @@ export async function refreshProject() {
   emit("project", state.project);
 }
 
-/** Poll a job until it finishes. onUpdate gets every snapshot. */
+/** Poll a job until it finishes. onUpdate gets every snapshot. A long job that ends while the user looks elsewhere
+ * says so (the autopilot sends its own, more specific message). */
 export async function watchJob(jobId, onUpdate) {
+  const t0 = Date.now();
   for (;;) {
     const job = await get(`/api/jobs/${jobId}`);
     onUpdate && onUpdate(job);
-    if (["completed", "needs_review", "failed"].includes(job.status)) return job;
+    if (["completed", "needs_review", "failed"].includes(job.status)) {
+      if (job.kind !== "autopilot" && Date.now() - t0 > 20000) {
+        notify(job.status === "failed" ? "Something failed" : "Done", `${JOB_LABELS[job.kind] || job.kind}: ${job.status.replace("_", " ")}`);
+      }
+      return job;
+    }
     await new Promise((r) => setTimeout(r, 900));
   }
 }
@@ -75,9 +83,24 @@ async function openProject(pid) {
     state.buildId = state.project.builds.find((b) => b.status === "completed")?.id ?? state.project.builds[0]?.id ?? null;
     localStorage.setItem("twin.project", pid);
     emit("project", state.project);
+    resume(state.project);   // an autopilot run still going is followed again
   } catch (e) {
     showError(e, "Could not open project");
   }
+}
+
+/** Files dropped before any project exists: a project named after them, the files sorted into it, ready to make. */
+async function startFromFiles(files) {
+  const main = files.find((f) => /\.pdf$/i.test(f.name)) || files.find((f) => /\.(png|jpe?g)$/i.test(f.name)) || files[0];
+  const name = main.name.replace(/\.[^.]+$/, "").replace(/[_\-.]+/g, " ").replace(/\s+/g, " ").trim();
+  try {
+    const p = await post("/api/projects", { name: (name.charAt(0).toUpperCase() + name.slice(1)).slice(0, 120) || "My building" });
+    await uploadFiles(p.id, files);
+    state.projects = await get("/api/projects");
+    renderProjectSelect();
+    await openProject(p.id);
+    switchTab("brief");
+  } catch (e) { showError(e, "Could not create the project"); }
 }
 
 async function newProject() {
@@ -99,6 +122,29 @@ async function newProject() {
   }
 }
 
+async function deleteProject() {
+  const p = state.project;
+  if (!p) return;
+  const n = (k, one) => `${k} ${one}${k === 1 ? "" : "s"}`;
+  const ok = await confirmDialog("Delete project",
+    `Delete "${p.name}" with its ${n(p.files.length, "uploaded file")}, ${n(p.versions.length, "layout version")} and ` +
+    `${n(p.builds.length, "3D model build")}? This cannot be undone.`, "Delete project", true);
+  if (!ok) return;
+  try {
+    await del(`/api/projects/${p.id}`);
+  } catch (e) {
+    showError(e, "Could not delete project");
+    return;
+  }
+  for (const key of [`twin.plan.${p.id}`, `twin.refsOff.${p.id}`]) localStorage.removeItem(key);
+  if (localStorage.getItem("twin.project") === p.id) localStorage.removeItem("twin.project");
+  state.projects = state.projects.filter((x) => x.id !== p.id);
+  state.version = null;
+  state.buildId = null;
+  await openProject("");
+  toast(`Deleted ${p.name}`, "ok");
+}
+
 /**
  * Where the project stands and the one thing to do next (a slim bar under the tabs, plus ticks on finished steps).
  * Steps: 1 plan uploaded + layout created, 2 layout ready to build, 3 3D model built for the newest version.
@@ -109,22 +155,30 @@ function projectProgress(p) {
   const built = v && p.builds.find((b) => b.version === v.number && b.status === "completed");
   // a job left "processing" by a server restart must not hold the bar forever
   const running = p.jobs?.find((j) => ["queued", "processing"].includes(j.status) && Date.now() / 1000 - j.created_at < 3600);
+  const ap = latestRun();
+  const apRunning = isRunningJob(ap);
   const counts = v?.counts || {};
   const blocking = (counts.error || 0) + (counts.review || 0);
   const done = { brief: !!v, review: !!v?.can_generate, generate: !!built };
-  let msg, action = null, tab = null, cls = "";
-  if (running) {
+  const aiOn = !!state.health?.ai?.configured;
+  let msg, action = null, tab = null, cls = "", auto = null;
+  if (apRunning) {
+    msg = `Making your 3D model${ap.stage ? `: ${ap.stage}` : "…"} You can leave this page; it tells you when it is done.`;
+  } else if (running) {
     msg = `Working: ${JOB_LABELS[running.kind] || running.kind}${running.stage ? ` (${running.stage})` : ""}…`;
   } else if (!v && !plan) {
-    msg = "Start by adding your floor plan (PNG, JPG or PDF) and the sizes you know.";
-    action = "Add the floor plan"; tab = "brief";
+    msg = "Start by dropping in your drawings: the floor plan (PDF, PNG or JPG), and the HVAC drawing, furniture list or photos if you have them.";
+    action = "Add drawings"; tab = "brief";
   } else if (!v) {
-    msg = "Your plan is uploaded. Let the AI read it and create the layout.";
-    action = "Create the layout"; tab = "brief";
+    msg = aiOn ? "Your drawings are in. One click reads them and builds the 3D model." : "Your plan is uploaded. Set up the AI to read it, or trace it by hand.";
+    if (aiOn) auto = { label: "Make the 3D model", title: "Read the plan, fix the problems, accept the estimates and build the model" };
+    else { action = "Other ways to start"; tab = "brief"; }
   } else if (!v.can_generate) {
-    msg = `Layout v${v.number} has ${blocking} thing${blocking === 1 ? "" : "s"} to sort out before the 3D model can be built. ` +
-      "Most can be fixed with one click.";
-    action = "Fix the layout"; tab = "review";
+    const stopped = ap?.result?.stopped && ap.result.version === v.number ? ap.result.stopped : null;
+    msg = stopped?.code === "NEEDS_YOU" ? stopped.message
+      : `Layout v${v.number} has ${blocking} thing${blocking === 1 ? "" : "s"} to sort out before the 3D model can be built. Most are fixed automatically.`;
+    auto = { label: "Finish automatically", title: "Fix what can be fixed, accept the estimates and build the model" };
+    action = "Look at the layout"; tab = "review";
   } else if (!built) {
     msg = `Layout v${v.number} is ready${counts.warning ? ` (${counts.warning} minor thing${counts.warning === 1 ? "" : "s"} worth a look)` : ""}. Build the 3D model next.`;
     action = "Build the 3D model"; tab = "generate";
@@ -132,10 +186,10 @@ function projectProgress(p) {
     msg = `The 3D model of v${v.number} is ready. Walk through it, or see the live HVAC view.`;
     action = "View in 3D"; tab = "generate"; cls = "done";
   }
-  return { msg, action, tab, done, cls };
+  return { msg, action, tab, done, cls, running: !!running || apRunning, built, auto, apRunning };
 }
 
-export const JOB_LABELS = { interpret: "the AI is reading the plan", fix: "the AI is changing the layout", solve: "fixing problems",
+export const JOB_LABELS = { autopilot: "making the 3D model", interpret: "the AI is reading the plan", fix: "the AI is changing the layout", solve: "fixing problems",
   furniture: "detecting furniture", build: "building the 3D model", layer_build: "updating the 3D model",
   unreal_import: "preparing the Unreal scene", hvac_import: "reading the HVAC drawing", redesign: "redesigning a room" };
 
@@ -153,13 +207,28 @@ function renderNextStep() {
   el.className = "next-step" + (st.cls ? " " + st.cls : "");
   mount(el,
     h("div.steps", null, steps.map(([t, label]) => h("span" + (st.done[t] ? ".done" : t === now ? ".now" : ""), null, (st.done[t] ? "✓ " : "") + label))),
+    st.running ? h("span.spinner", { title: "working" }) : null,
     h("div.msg", null, st.msg),
-    st.action && state.activeTab !== st.tab ? h("button.btn.primary.small", { onclick: () => switchTab(st.tab) }, st.action + " →") : null);
+    st.apRunning && state.activeTab !== "brief" ? h("button.btn.small", { onclick: () => switchTab("brief"), title: "See every step" }, "Details") : null,
+    st.auto ? h("button.btn.primary.small", { title: st.auto.title, onclick: () => startAutopilot() }, st.auto.label) : null,
+    st.built && state.health?.desktop_viewer?.available
+      ? h("button.btn.primary.small", { title: "Walk through the newest 3D model in Unreal Engine on this PC", onclick: () => viewInUnreal(p, st.built) },
+        "View in Unreal Engine") : null,
+    st.action && state.activeTab !== st.tab ? h("button.btn" + (st.built || st.auto ? "" : ".primary") + ".small", { onclick: () => switchTab(st.tab) }, st.action + " →") : null);
+}
+
+/** One click from anywhere: the newest built model opens in the packaged Unreal viewer on this PC. */
+async function viewInUnreal(p, build) {
+  try {
+    const r = await post(`/api/projects/${p.id}/viewer/open-local`, { build_id: build.id });
+    toast(r.started ? "Opening the 3D model in Unreal Engine… (a few seconds)" : "The Unreal viewer is already opening.", "ok", 6000);
+  } catch (e) { showError(e, "View in Unreal Engine"); }
 }
 
 function updateVisibility() {
   const has = !!state.project;
   $("emptyState").classList.toggle("hidden", has);
+  $("deleteProjectBtn").classList.toggle("hidden", !has);
   document.querySelectorAll(".tab-panel").forEach((p) => p.classList.toggle("hidden", !has));
   document.querySelectorAll(".tab").forEach((t) => /** @type {HTMLButtonElement} */ (t).disabled = !has);
 }
@@ -167,7 +236,9 @@ function updateVisibility() {
 async function init() {
   document.querySelectorAll(".tab").forEach((t) => t.addEventListener("click", () => switchTab(t.getAttribute("data-tab"))));
   $("newProjectBtn").addEventListener("click", newProject);
+  $("deleteProjectBtn").addEventListener("click", deleteProject);
   $("emptyNewBtn").addEventListener("click", newProject);
+  mount($("emptyDrop"), dropzone(startFromFiles, "Drop your drawings here to start: floor plan, HVAC drawing, furniture list, photos"));
   $("projectSelect").addEventListener("change", (e) => openProject(/** @type {HTMLSelectElement} */ (e.target).value));
   try {
     [state.health, state.catalog, state.projects] = await Promise.all([get("/api/health"), get("/api/catalog"), get("/api/projects")]);
@@ -179,13 +250,14 @@ async function init() {
   renderProjectSelect();
   on("project", () => { renderProjectSelect(); updateVisibility(); renderNextStep(); });
   on("tab", () => renderNextStep());
+  on("autopilot", () => renderNextStep());
   on("project", () => get("/api/projects").then((p) => { state.projects = p; renderProjectSelect(); }).catch(() => {}));
   renderBrief($("tab-brief"));
   renderReview($("tab-review"));
   renderGenerate($("tab-generate"));
   renderActivity($("tab-activity"));
   renderLive($("tab-live"));
-  setInterval(() => get("/api/health").then((hl) => { state.health = hl; renderStatus(); }).catch(() => {}), 30000);
+  setInterval(() => get("/api/health").then((hl) => { state.health = hl; renderStatus(); renderNextStep(); }).catch(() => {}), 30000);
   const last = localStorage.getItem("twin.project");
   if (last && state.projects.some((p) => p.id === last)) await openProject(last);
   else updateVisibility();

@@ -171,8 +171,10 @@ release flavour (no console, smaller); `--zip` also writes a zip.
 
 ## Launching on this PC
 
-When the web app runs in a browser on the same computer as the backend, **Generate & preview → Unreal Engine 5 →
-Open on this PC** (and the same button on a multi-floor building) starts the packaged viewer directly: the
+When the web app runs in a browser on the same computer as the backend, **View in Unreal Engine** starts the
+packaged viewer directly. The button is in the bar under the tabs as soon as a 3D model is built (it opens the
+newest completed build), in the header of every build on **Generate & preview**, in its Unreal Engine 5 card and on
+a multi-floor building; it is greyed out with the reason until a viewer is packaged. The
 backend launches `TWIN_DESKTOP_VIEWER_EXE`, else `dist/TwinViewerShipping`, else `dist/TwinViewer`, with a fresh
 read-only token in a file that is deleted after two minutes (`twin/viewer/local.py`). The route only accepts requests
 from 127.0.0.1 / ::1 without proxy headers and is off when `TWIN_PUBLIC_URL` is set, so a server reachable from the

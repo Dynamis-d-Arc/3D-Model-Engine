@@ -69,9 +69,11 @@ def test_full_flow_in_browser(server):
         page.click("#emptyNewBtn")
         page.fill("dialog input[name=name]", "E2E flat")
         page.click("dialog button[value=ok]")
-        page.wait_for_selector("text=Project brief")
+        page.wait_for_selector("text=Make the 3D model for me")              # the one-click autopilot card
+        assert page.locator(".dropzone", has_text="Drop your drawings here").count() == 1
 
         # load the known-measurement layout -> review tab
+        page.click("summary:has-text('Other ways to start')")
         page.click("text=Use sample apartment")
         page.wait_for_selector(".problems >> text=ready to build", timeout=15000)
         assert page.locator(".problems", has_text="No problems found").count() == 1   # the checklist

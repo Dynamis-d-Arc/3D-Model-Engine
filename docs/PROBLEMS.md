@@ -40,12 +40,14 @@ fix that fits it:
 | `W_DOOR_SWING_BLOCKED` | moved (≤ 1.5 m) clear of every door swing in the room, staying in the room |
 | `W_FURNITURE_OVERLAP` | the smaller item moves (≤ 1.5 m) until it is clear |
 | `W_FURNITURE_TOO_TALL` | lowered under the ceiling (if it stays in its size range) |
-| `E_OPENING_AT_JUNCTION`, `E_OPENING_OVERLAP`, `E_OPENING_OUTSIDE_WALL` | slid along its wall (≤ 1 m) to a free spot between the same two rooms; if none, narrowed in 5 cm steps (doors to 0.7 m, windows 0.4 m) |
+| `E_OPENING_AT_JUNCTION`, `E_OPENING_OVERLAP`, `E_OPENING_OUTSIDE_WALL` | slid along its wall (≤ 1 m) to a free spot between the same two rooms; if none, narrowed in 5 cm steps (doors to 0.7 m, windows 0.4 m); on a wall too short for that (e.g. a facet of a curved bay) it fills the free stretch clear of the corners (doors ≥ 0.6 m, windows ≥ 0.25 m); a window with no room even for that is removed (said so in the list; a door never is) |
 | `E_OPENING_TOO_TALL` | lowered under the wall top |
 | `W_WALL_OVERSHOOT` | the short stub is trimmed back to the crossing (only if no opening sits on the trimmed part) |
 
 Rules run in passes until nothing more changes (a fix can uncover another). A rule that cannot fix a case leaves
-it alone. A changed value keeps its review status (an estimate stays an estimate) and gets a note.
+it alone; in the checklist that problem then gets an **Ask AI** button next to its **Fix**, and a free fix that changed
+nothing leaves the editor clean (no undo step, no "unsaved"). A changed value keeps its review status (an estimate
+stays an estimate) and gets a note.
 
 Measured on real projects (rules only): an AI-read library plan went from 4 errors + 35 warnings to 5 warnings
 in about 2 s; two large CAD floors (40–60 rooms, 500–650 furniture items) from 202 → 25 and 405 → 100 warnings

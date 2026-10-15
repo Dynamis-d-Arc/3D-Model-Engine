@@ -79,6 +79,39 @@ def test_door_between_close_walls_is_narrowed(scene_dict):
     assert "E_OPENING_AT_JUNCTION" not in codes(report)
 
 
+def chamfered_room(cut: float, kind: str = "window", width: float = 0.45):
+    """A 4 x 3 m room whose south-east corner is cut at 45 degrees by a wall `cut` m on each side; one opening on it."""
+    from twin.scene.model import Scene
+    pts = [(0, 0), (4 - cut, 0), (4, cut), (4, 3), (0, 3)]
+    walls = [{"id": f"W{i + 1}", "level_id": "L0", "start": pts[i], "end": pts[(i + 1) % 5], "thickness": 0.25, "kind": "exterior"}
+             for i in range(5)]
+    length = 2 ** 0.5 * cut
+    op = {"id": "O1", "kind": kind, "wall_id": "W2", "offset": length / 2, "width": width, "height": 2.1 if kind == "door" else 1.2,
+          "sill_height": 0.0 if kind == "door" else 0.9}
+    return Scene.model_validate({"project": {"name": "chamfer"}, "levels": [{"id": "L0", "name": "Ground"}],
+                                 "rooms": [{"id": "R1", "name": "Room", "type": "living", "level_id": "L0", "polygon": pts}],
+                                 "walls": walls, "openings": [op]})
+
+
+def test_window_on_a_short_wall_is_shrunk_to_its_free_stretch():
+    s = chamfered_room(0.48)                    # 0.68 m wall; the joints leave 0.33 m clear, under the 0.40 m minimum
+    assert "E_OPENING_AT_JUNCTION" in codes(validate_scene(s))
+    fixed, actions, report = autofix(s, codes={"E_OPENING_AT_JUNCTION"})
+    o = fixed.openings[0]
+    assert 0.25 <= o.width < 0.4 and "narrowed it 0.45" in actions[0].text and "clear of its corners" in actions[0].text
+    assert "E_OPENING_AT_JUNCTION" not in codes(report) and report.can_generate
+
+
+def test_window_with_no_room_is_removed_but_a_door_never_is():
+    s = chamfered_room(0.38)                    # 0.54 m wall, 0.19 m clear: too little even for a narrow window
+    assert "E_OPENING_AT_JUNCTION" in codes(validate_scene(s))
+    fixed, actions, report = autofix(s, codes={"E_OPENING_AT_JUNCTION"})
+    assert fixed.openings == [] and "removed it" in actions[0].text and report.can_generate
+    fixed, actions, report = autofix(chamfered_room(0.38, "door", 0.5), codes={"E_OPENING_AT_JUNCTION"})
+    assert [o.id for o in fixed.openings] == ["O1"] and not actions
+    assert "E_OPENING_AT_JUNCTION" in codes(report)
+
+
 def test_furniture_into_wall_is_nudged_back(scene_dict):
     s = mutate(scene_dict, lambda d: furn(d, "F25").update(position=[8.2, 0.3]))   # desk into the south wall
     assert "W_FURNITURE_CROSSES_BOUNDARY" in codes(validate_scene(s))

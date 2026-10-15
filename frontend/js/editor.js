@@ -4,7 +4,7 @@ import { get, post, put } from "./api.js";
 import { refreshProject, switchTab } from "./app.js";
 import { planFileId } from "./brief.js";
 import { state, on, emit, assetById, ROOM_COLORS } from "./state.js";
-import { h, mount, toast, showError, badge, ask, confirmDialog, fmtM } from "./ui.js";
+import { h, mount, toast, showError, badge, ask, confirmDialog, fmtM, jobProgress, isRunningJob } from "./ui.js";
 import { problemsCard } from "./problems.js";
 
 const SVGNS = "http://www.w3.org/2000/svg";
@@ -287,6 +287,7 @@ function scheduleValidate() {
 async function serverTool(path, body, message) {
   try {
     const res = await post(path, { scene, ...body });
+    if (Array.isArray(res.actions) && !res.actions.length) return res;   // nothing changed: no undo step, no "unsaved"
     edit(() => { scene = res.scene; });
     const text = message && message(res);
     if (text) toast(text, "ok");
@@ -623,6 +624,21 @@ async function importSensorSheet(file) {
       (res.problems.length ? `, ${res.problems.length} row(s) skipped — ${res.problems.slice(0, 3).join("; ")}` : "");
     toast(msg + (res.added.length || res.updated.length ? ". Check them, then save a new version." : ""), res.problems.length ? "error" : "ok", 12000);
   } catch (e) { showError(e, "Sensor sheet"); }
+}
+
+async function importFurnitureList(file) {
+  if (!file) return;
+  try {
+    const text = await file.text();
+    const res = await post("/api/scene/import-furniture", { scene, text, replace: true });
+    if (res.added) {
+      edit(() => { scene = res.scene; });
+      autosave(`furniture list ${file.name}: ${res.added} items`);
+    }
+    toast(`Furniture list ${file.name}: ${res.added} placed, ${res.removed} replaced` +
+      (res.problems.length ? `, ${res.problems.length} row(s) skipped — ${res.problems.slice(0, 3).join("; ")}` : ""),
+      res.problems.length ? "error" : "ok", 12000);
+  } catch (e) { showError(e, "Furniture list"); }
 }
 
 function startDrag(e, apply) {
@@ -988,7 +1004,7 @@ function sensorsCard() {
       : "Only the sensor layer changed: after saving, the saved 3D model is updated in place — nothing is regenerated."));
   let offer = null;
   if (layerJob) {
-    offer = h("div.notice", { style: { margin: "6px 0" } }, badge(layerJob.status), " ", layerJob.stage || "updating the saved model…");
+    offer = h("div.notice", { style: { margin: "6px 0" } }, jobProgress({ ...layerJob, stage: layerJob.stage || "updating the saved model…" }));
   } else if (layerOffer && layerOffer.version === loadedVersion && !dirty) {
     const L = layerOffer.options.layer;
     const c = L.changes;
@@ -1093,8 +1109,8 @@ function hvacCard() {
         (hv.source?.file_name ? ` — from ${hv.source.file_name} (${hv.source.method}${hv.source.residual_m != null ? `, ±${(hv.source.residual_m * 1000).toFixed(0)} mm` : ""})` : "")
       : "No HVAC layer in this version."),
     files.length ? h("div.row", null, fileSel,
-      h("button.btn.small" + (hvacCount() ? "" : ".primary"), { onclick: () => importHvac(fileSel.value), disabled: dirty || running,
-        title: dirty ? "Save your edits first" : "Align the drawing to this plan, read it and place the HVAC elements (creates a new version)" },
+      h("button.btn.small" + (hvacCount() ? "" : ".primary"), { onclick: () => importHvac(fileSel.value), disabled: running,
+        title: dirty ? SAVES_FIRST : "Align the drawing to this plan, read it and place the HVAC elements (creates a new version)" },
         hvacCount() ? "Re-import" : "Import HVAC drawing"))
       : h("p.small.muted", null, "Upload the HVAC / ACMV drawing (vector PDF) in step 1 to import it."),
     hvacCount() ? h("div.row", { style: { marginTop: "6px" } },
@@ -1104,11 +1120,8 @@ function hvacCard() {
 }
 
 function drawHvacJob(el, job) {
-  const pct = Math.round((job.progress || 0) * 100);
   const r = job.result;
-  mount(el, h("div", { style: { marginTop: "8px" } },
-    h("div.row", null, badge(job.status), h("span.small", null, job.stage || ""), h("span.spacer"), h("span.small.muted", null, `${pct}%`)),
-    h("div.progress", { style: { marginTop: "6px" } }, h("div", { style: { width: `${pct}%` } })),
+  mount(el, h("div", { style: { marginTop: "8px" } }, jobProgress(job),
     job.status === "failed" ? h("div.notice.error", { style: { marginTop: "6px" } }, h("b", null, job.error?.code), ": ", job.error?.message) : null,
     r ? h("div.notice.ok", { style: { marginTop: "6px" } },
       h("div", null, `v${r.version}: ${r.counts.units} units, ${r.counts.supply_diffusers} diffusers (${r.counts.diffusers_with_labelled_airflow} with a labelled airflow), ${r.counts.return_grilles} grilles, ${r.counts.ducts} ducts (${r.counts.duct_length_m} m).`),
@@ -1119,7 +1132,7 @@ function drawHvacJob(el, job) {
 }
 
 async function importHvac(fileId) {
-  if (!fileId) return;
+  if (!fileId || !(await ensureSaved())) return;
   try {
     hvacJob = await post(`/api/projects/${state.project.id}/versions/${loadedVersion}/hvac`, { file_id: fileId });
     drawSide();
@@ -1150,27 +1163,30 @@ function furnitureCard() {
   for (const f of scene.furniture) counts[f.asset_id] = (counts[f.asset_id] || 0) + 1;
   const top = Object.entries(counts).sort((a, b) => b[1] - a[1]).slice(0, 6)
     .map(([k, n]) => `${n}× ${assetById(k)?.name || k}`).join(", ");
+  const listIn = h("input", { type: "file", accept: ".csv,text/csv", style: { display: "none" },
+    onchange: (e) => { importFurnitureList(e.target.files[0]); e.target.value = ""; } });
   return h("div.card", null, h("h2", null, "Furniture & equipment"),
     h("div.small", { style: { margin: "0 0 6px" } }, scene.furniture.length
       ? `${scene.furniture.length} items in ${new Set(scene.furniture.map((f) => f.room_id)).size} rooms — ${top}` : "No furniture in this version."),
+    h("div.row", { style: { margin: "0 0 6px" } },
+      h("button.btn.small", { onclick: () => listIn.click(),
+        title: "CSV with catalog_id, x, y (or plan_x_m, plan_y_m), optional room, width_m, depth_m, height_m, rotation_deg. " +
+          "It replaces the AI's furniture; items you placed by hand stay." }, "Import furniture list (CSV)"), listIn),
     est && !est.available ? h("p.small.muted", null, est.reason) : null,
     est && est.available ? h("p.small.muted", { style: { margin: "0 0 6px" } },
       `Reads every drawn item on the vector plan in ${est.tiles} high-resolution tiles with ${est.model} ` +
       `(≈ $${est.est_usd?.toFixed(2) ?? "?"}${est.remaining_usd != null ? ` of $${est.remaining_usd.toFixed(2)} left` : ""}). ` +
       "Creates a new version; items you placed by hand are kept.") : null,
     h("div.row", null, h("span.spacer"),
-      h("button.btn.primary", { disabled: !ai.configured || dirty || running || !(est && est.available),
-        title: !ai.configured ? "AI is not configured" : dirty ? "Save your edits first" : "",
+      h("button.btn.primary", { disabled: !ai.configured || running || !(est && est.available),
+        title: !ai.configured ? "AI is not configured" : dirty ? SAVES_FIRST : "",
         onclick: () => runFurniture() }, running ? "Detecting…" : "Detect furniture (AI)")),
     status);
 }
 
 function drawFurnJob(el, job) {
-  const pct = Math.round((job.progress || 0) * 100);
   const r = job.result;
-  mount(el, h("div", { style: { marginTop: "8px" } },
-    h("div.row", null, badge(job.status), h("span.small", null, job.stage || ""), h("span.spacer"), h("span.small.muted", null, `${pct}%`)),
-    h("div.progress", { style: { marginTop: "6px" } }, h("div", { style: { width: `${pct}%` } })),
+  mount(el, h("div", { style: { marginTop: "8px" } }, jobProgress(job),
     job.status === "failed" ? h("div.notice.error", { style: { marginTop: "6px" } }, h("b", null, job.error?.code), ": ", job.error?.message,
       Array.isArray(job.error?.detail) ? h("ul.fix-changes", null, job.error.detail.map((d) => h("li", null, d))) : null) : null,
     r ? h("div.notice.ok", { style: { marginTop: "6px" } },
@@ -1185,6 +1201,7 @@ function drawFurnJob(el, job) {
 }
 
 async function runFurniture(body = {}) {
+  if (!(await ensureSaved())) return;
   try {
     // a retry runs against the version the first run started from
     const base = body.reuse_job_id && furnJob?.version ? furnJob.version : loadedVersion;
@@ -1216,15 +1233,16 @@ function fixCard() {
     h("div.row", { style: { marginTop: "6px" } },
       h("span.small.muted", null, selText ? `About: ${selText}` : "Tip: select a room, unit or diffuser first"),
       h("span.spacer"),
-      h("button.btn.primary", { disabled: !ai.configured || dirty || running, title: !ai.configured ? "AI is not configured" : dirty ? "Save your edits first" : "",
+      h("button.btn.primary", { disabled: !ai.configured || running, title: !ai.configured ? "AI is not configured" : dirty ? SAVES_FIRST : "",
         onclick: () => (ta.value.trim().length >= 3 ? runFix(ta.value.trim(), selText ? [selText] : []) : toast("Describe the problem first.", "error")) }, "Fix")),
+    dirty && ai.configured ? h("div.small.muted", { style: { marginTop: "4px" } }, "You have unsaved edits: they are saved as a new version before the AI starts.") : null,
     status);
 }
 
 function drawFixJob(el, job) {
   const r = job.result;
   mount(el, h("div", { style: { marginTop: "8px" } },
-    h("div.row", null, badge(job.status), h("span.small", null, job.stage || "")),
+    isRunningJob(job) ? jobProgress(job) : h("div.row", null, badge(job.status), h("span.small", null, job.stage || "")),
     job.status === "failed" ? h("div.notice.error", { style: { marginTop: "6px" } }, h("b", null, job.error?.code), ": ", job.error?.message,
       Array.isArray(job.error?.detail) ? h("ul.fix-changes", null, job.error.detail.map((d) => h("li", null, d))) : null) : null,
     r ? h("div.notice." + (r.version ? "ok" : "warn"), { style: { marginTop: "6px" } },
@@ -1235,6 +1253,7 @@ function drawFixJob(el, job) {
 }
 
 async function runFix(prompt, selection) {
+  if (!(await ensureSaved())) return;     // the AI works on a saved version; unsaved edits would be lost on reload
   try {
     fixJob = await post(`/api/projects/${state.project.id}/versions/${loadedVersion}/fix`, { prompt, selection });
     drawSide();
@@ -1255,6 +1274,31 @@ async function fixDialog(target) {
   if (v && v.prompt) runFix(v.prompt, [target]);
 }
 
+
+const SAVES_FIRST = "Your unsaved edits are saved as a new version first";
+
+/**
+ * Save after a one-click checklist action, without asking: a burst of clicks within a moment becomes one version.
+ * Edits drawn by hand still wait for "Save version".
+ */
+let autosaveTimer = null;
+const autosaveNotes = [];
+function autosave(note) {
+  autosaveNotes.push(note);
+  clearTimeout(autosaveTimer);
+  autosaveTimer = setTimeout(async () => {
+    const notes = autosaveNotes.splice(0);
+    if (!dirty || !scene) return;
+    const text = [...new Set(notes)].join("; ").slice(0, 900) || "checklist fixes";
+    try {
+      const res = await post(`/api/projects/${state.project.id}/versions`, { scene, parent: loadedVersion, note: text, source: "edit" });
+      dirty = false;
+      await refreshProject();
+      await loadVersion(res.number, true);
+      toast(`Saved as v${res.number}${res.validation.can_generate ? " — ready to build" : ""}. The previous version is kept.`, "ok", 5000);
+    } catch (e) { showError(e, "Saving failed"); }
+  }, 1200);
+}
 
 /** Save unsaved edits as a new version without asking (jobs start from a saved version). */
 async function ensureSaved(note = "edited in review") {
@@ -1301,7 +1345,7 @@ function problemsCtx() {
     const [type, id] = String(t).split(":");
     if (["room", "wall", "opening", "furniture", "hvac_unit", "hvac_terminal", "duct", "sensor"].includes(type)) select({ type, id });
   };
-  return { report, reportError, scene, dirty, version: loadedVersion, select: target, tool: serverTool, edit,
+  return { report, reportError, scene, dirty, version: loadedVersion, select: target, tool: serverTool, edit, autosave,
     solve: runSolve, solveJob, estimate: solveEstimate?.key === key ? solveEstimate.data : null, redraw: drawSide };
 }
 
@@ -1368,16 +1412,18 @@ function drawToolbar() {
   const menuItem = (label, fn, title, disabled = false) => h("button.menu-item", { title, disabled, onclick: (e) => {
     /** @type {HTMLElement} */ (e.target).closest("details")?.removeAttribute("open"); fn(); } }, label);
   mount(toolbarEl,
-    h("b", null, `v${loadedVersion}${dirty ? " · unsaved" : ""}`),
-    h("button.btn.small", { onclick: doUndo, disabled: !undo.length, title: "Undo (Ctrl+Z)" }, "↶ Undo"),
-    h("button.btn.small", { onclick: doRedo, disabled: !redo.length, title: "Redo (Ctrl+Y)" }, "↷ Redo"),
+    h("span.ver-chip" + (dirty ? ".dirty" : ""), { title: dirty ? "Edits not saved yet: Save version keeps them as a new version" : "Everything in this version is saved" },
+      h("b", null, `v${loadedVersion}`), h("span.dot"), h("span.ver-state", null, dirty ? "Unsaved changes" : "Saved")),
+    h("span.tb-seg", null,
+      h("button.btn.small.icon", { onclick: doUndo, disabled: !undo.length, title: "Undo (Ctrl+Z)", "aria-label": "Undo" }, "↶"),
+      h("button.btn.small.icon", { onclick: doRedo, disabled: !redo.length, title: "Redo (Ctrl+Y)", "aria-label": "Redo" }, "↷")),
     h("span.tb-sep"),
     h("button.btn.small" + (mode === "draw-room" ? ".primary" : ""), { onclick: () => { mode = mode === "draw-room" ? "select" : "draw-room"; sel = null; drawAll(); },
-      title: "Drag a rectangle on the plan (wall centrelines); snaps to 5 cm, hold Alt for 1 mm" }, "Draw room"),
+      title: "Drag a rectangle on the plan (wall centrelines); snaps to 5 cm, hold Alt for 1 mm" }, "▭ Draw room"),
     h("button.btn.small", { onclick: addFurnitureDialog, title: "Add a furniture item to the selected room" }, "+ Furniture"),
     h("button.btn.small" + (mode === "place-sensor" ? ".primary" : ""), { onclick: () => { mode = mode === "place-sensor" ? "select" : "place-sensor"; sel = null; drawAll(); },
       title: "Click on the plan to place sensors (Esc stops)" }, "+ Sensor"),
-    h("details.menu", null, h("summary.btn.small", { title: "Less common layout tools" }, "More tools ▾"),
+    h("details.menu", null, h("summary.btn.small", { title: "Less common layout tools" }, "More ▾"),
       h("div.menu-pop", null,
         menuItem("Add a room by coordinates…", addRoomDialog, "Add a rectangular room by typing its coordinates"),
         menuItem("Rebuild walls from rooms", () => serverTool("/api/scene/derive-walls", {}, (r) => `Walls rebuilt from rooms (${r.scene.walls.length} walls)${r.notes.length ? "; " + r.notes.join("; ") : ""}`),
@@ -1385,12 +1431,14 @@ function drawToolbar() {
         menuItem("Scale to the size in the brief", fitToBrief, "Scale the layout to the brief's outer dimensions"),
         menuItem(ul?.calibrated ? "Re-calibrate the plan image" : "Calibrate the plan image", startCalibration, "Click two points a known distance apart", !ul))),
     h("span.tb-sep"),
-    ul ? h("label.small", { title: "Show the uploaded plan under the layout" }, h("input", { type: "checkbox", checked: underlay.visible, onchange: (e) => { underlay.visible = e.target.checked; draw(); } }), " plan") : null,
-    ul ? h("input", { type: "range", min: "0.1", max: "1", step: "0.05", value: underlay.opacity, title: "Plan image opacity", style: { width: "70px" }, oninput: (e) => { underlay.opacity = Number(e.target.value); draw(); } }) : null,
-    h("button.btn.small", { onclick: () => { fitView(); draw(); }, title: "Show the whole layout" }, "Zoom to fit"),
+    ul ? h("span.tb-plan", { title: "The uploaded plan drawn under the layout" },
+      h("label", null, h("input", { type: "checkbox", checked: underlay.visible, onchange: (e) => { underlay.visible = e.target.checked; draw(); drawToolbar(); } }), " Plan image"),
+      h("input", { type: "range", min: "0.1", max: "1", step: "0.05", value: underlay.opacity, disabled: !underlay.visible, title: "Plan image opacity",
+        "aria-label": "Plan image opacity", oninput: (e) => { underlay.opacity = Number(e.target.value); draw(); } })) : null,
+    h("button.btn.small", { onclick: () => { fitView(); draw(); }, title: "Show the whole layout" }, "⤢ Fit"),
     h("span.spacer"),
-    report?.can_generate && !dirty ? h("button.btn.small", { onclick: () => switchTab("generate") }, "Go to generate →") : null,
-    h("button.btn.primary", { onclick: save, disabled: !dirty, title: dirty ? "Save your edits as a new version" : "No unsaved edits" }, "Save version"));
+    report?.can_generate && !dirty ? h("button.btn.small", { onclick: () => switchTab("generate"), title: "Build or view the 3D model of this version" }, "3D model →") : null,
+    dirty ? h("button.btn.primary.small.tb-save", { onclick: save, title: "Save your edits as a new version (the old one is kept)" }, "Save version") : null);
 }
 
 async function addRoomDialog() {
@@ -1439,9 +1487,8 @@ async function fitToBrief() {
 
 async function redesignDialog(room) {
   if (!state.health.ai.configured) return toast("AI is not configured; edit the furniture manually instead.", "error");
-  if (dirty) return toast("Save your edits first; the redesign starts from a saved version.", "error");
   const v = await ask(`Redesign ${room.name} with AI`, [{ name: "prompt", label: "What should change in this room only?", type: "textarea", value: "" }], "Redesign");
-  if (!v || !v.prompt) return;
+  if (!v || !v.prompt || !(await ensureSaved())) return;
   try {
     const job = await post(`/api/projects/${state.project.id}/versions/${loadedVersion}/rooms/${room.id}/redesign`, { prompt: v.prompt });
     toast("Redesign started; a new version will appear when it is ready.", "info");
