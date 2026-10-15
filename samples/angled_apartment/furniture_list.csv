@@ -1,0 +1,46 @@
+id,room,item,catalog_id,width_m,depth_m,height_m,x_m,y_m,rotation_deg,plan_x_m,plan_y_m,notes
+F01,Kitchen,Kitchen counter run (sink + hob),kitchen_counter,2.4,0.62,0.92,1.9,0.44,0,6.9,6.94,"sink + hob, against the south wall"
+F02,Kitchen,Fridge,fridge,0.7,0.7,1.85,3.55,0.48,0,8.55,6.98,
+F03,Kitchen,Kitchen island,kitchen_island,1.6,0.85,0.92,2.2,2.3,0,7.2,8.8,
+F04,Kitchen,Bar stool,bar_stool,0.4,0.4,0.75,1.8,3.05,0,6.8,9.55,
+F05,Kitchen,Bar stool,bar_stool,0.4,0.4,0.75,2.6,3.05,0,7.6,9.55,
+F06,Laundry,Washing machine,washing_machine,0.6,0.6,0.85,1.55,4.56,0,6.55,11.06,washer
+F07,Laundry,Washing machine,washing_machine,0.6,0.6,0.85,2.2,4.56,0,7.2,11.06,dryer
+F08,Laundry,Tall storage cabinet,storage_cabinet,0.9,0.45,1.9,2.4,6.7,180,7.4,13.2,
+F09,Living / Dining,3-seat sofa,sofa_3seat,2.2,0.95,0.85,8.3,2.3,90,13.3,8.8,faces the TV
+F10,Living / Dining,Coffee table,coffee_table,1.1,0.6,0.42,9.45,2.3,90,14.45,8.8,
+F11,Living / Dining,TV unit with TV,tv_unit,1.8,0.45,1.3,10.71,2.3,90,15.71,8.8,against the study wall
+F12,Living / Dining,Rug,rug,2.4,1.7,0.015,9.4,2.3,90,14.4,8.8,
+F13,Living / Dining,Armchair,armchair,0.85,0.85,0.85,7.0,-0.5,20,12.0,6.0,"in the curved bay, turned 20 degrees"
+F14,Living / Dining,Armchair,armchair,0.85,0.85,0.85,8.0,-0.5,-20,13.0,6.0,"in the curved bay, turned -20 degrees"
+F15,Living / Dining,Floor lamp,floor_lamp,0.4,0.4,1.6,7.5,-0.95,0,12.5,5.55,between the bay armchairs
+F16,Living / Dining,Potted plant,plant,0.5,0.5,1.2,6.2,-0.12,0,11.2,6.38,
+F17,Living / Dining,Dining table,dining_table,1.6,0.9,0.75,6.0,4.4,0,11.0,10.9,6 seats
+F18,Living / Dining,Dining chair,dining_chair,0.45,0.52,0.88,5.6,3.72,0,10.6,10.22,
+F19,Living / Dining,Dining chair,dining_chair,0.45,0.52,0.88,6.4,3.72,0,11.4,10.22,
+F20,Living / Dining,Dining chair,dining_chair,0.45,0.52,0.88,5.6,5.08,180,10.6,11.58,
+F21,Living / Dining,Dining chair,dining_chair,0.45,0.52,0.88,6.4,5.08,180,11.4,11.58,
+F22,Living / Dining,Dining chair,dining_chair,0.45,0.52,0.88,4.92,4.4,270,9.92,10.9,
+F23,Living / Dining,Dining chair,dining_chair,0.45,0.52,0.88,7.08,4.4,90,12.08,10.9,
+F24,Living / Dining,Sideboard,sideboard,1.6,0.45,0.8,4.29,4.4,270,9.29,10.9,against the kitchen wall
+F25,Study,Desk,desk,1.4,0.7,0.75,11.85,3.55,0,16.85,10.05,
+F26,Study,Office chair,office_chair,0.62,0.62,1.05,11.85,2.9,0,16.85,9.4,
+F27,Study,Bookshelf,bookshelf,1.0,0.35,2.0,11.24,1.0,270,16.24,7.5,
+F28,Study,Potted plant,plant,0.5,0.5,1.2,13.45,2.15,0,18.45,8.65,by the 45 degree corner
+F29,Entry / Hall,Bench,bench,1.6,0.4,0.45,12.1,4.26,0,17.1,10.76,entry bench
+F30,Entry / Hall,Potted plant,plant,0.5,0.5,1.2,13.6,6.6,0,18.6,13.1,
+F31,Bedroom 2,Single bed,bed_single,0.95,2.05,0.95,3.15,9.4,90,8.15,15.9,head to the west
+F32,Bedroom 2,Wardrobe,wardrobe,1.8,0.6,2.1,4.64,8.95,270,9.64,15.45,
+F33,Bedroom 2,Desk,desk,1.4,0.7,0.75,2.066,7.803,78.69,7.066,14.303,follows the slanted facade
+F34,Bedroom 2,Office chair,office_chair,0.62,0.62,1.05,2.654,7.685,78.69,7.654,14.185,
+F35,Bathroom,Bathtub,bathtub,1.7,0.75,0.58,6.2,9.5,0,11.2,16.0,
+F36,Bathroom,Toilet,toilet,0.4,0.68,0.8,7.0,7.9,90,12.0,14.4,
+F37,Bathroom,Vanity with basin and mirror,vanity,0.8,0.5,1.8,5.31,8.3,270,10.31,14.8,
+F38,Master Bedroom,Double bed,bed_double,1.65,2.15,1.05,9.5,8.8,0,14.5,15.3,head to the north wall
+F39,Master Bedroom,Nightstand,nightstand,0.5,0.4,0.55,8.35,9.65,0,13.35,16.15,
+F40,Master Bedroom,Nightstand,nightstand,0.5,0.4,0.55,10.65,9.65,0,15.65,16.15,
+F41,Master Bedroom,Wardrobe,wardrobe,1.8,0.6,2.1,7.76,8.4,270,12.76,14.9,
+F42,Master Bedroom,Armchair,armchair,0.85,0.85,0.85,11.45,9.35,0,16.45,15.85,reading corner
+F43,Ensuite,Shower enclosure,shower,0.9,0.9,2.0,13.4,9.4,0,18.4,15.9,
+F44,Ensuite,Toilet,toilet,0.4,0.68,0.8,13.53,7.85,270,18.53,14.35,
+F45,Ensuite,Vanity with basin and mirror,vanity,0.8,0.5,1.8,12.55,9.62,180,17.55,16.12,
